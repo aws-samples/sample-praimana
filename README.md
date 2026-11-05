@@ -56,11 +56,9 @@ group): **Participant, Facilitator, Executive, Judge, Admin**.
 | Portal | Desktop |
 |---|---|
 
-https://github.com/user-attachments/assets/39b1a1a8-07eb-4b8b-a577-94a683b5f8d0
-
-
-
 https://github.com/user-attachments/assets/0a2bc49c-0a07-4335-9083-bda267ee683a
+
+https://github.com/user-attachments/assets/39b1a1a8-07eb-4b8b-a577-94a683b5f8d0
 
 ---
 

@@ -55,8 +55,8 @@ group): **Participant, Facilitator, Executive, Judge, Admin**.
 
 | Portal | Desktop |
 |---|---|
-| [![Praimana portal walkthrough on YouTube](videos/praimana-portal-cover.jpg)](https://youtu.be/IB8kiHhZPJY) | [![Praimana desktop walkthrough on YouTube](videos/praimana-desktop-cover.jpg)](https://youtu.be/VPmU0nyizXI) |
-| [▶ Watch the portal walkthrough](https://youtu.be/IB8kiHhZPJY) (1 min 52 s) | [▶ Watch the desktop walkthrough](https://youtu.be/VPmU0nyizXI) (2 min 5 s) |
+| [![Praimana portal walkthrough on YouTube](videos/praimana-portal-cover.jpg)](https://youtu.be/IB8kiHhZPJY) | [![Praimana desktop walkthrough on YouTube](videos/praimana-desktop-cover.jpg)](https://youtu.be/h7pZu25kP7Q) |
+| [▶ Watch the portal walkthrough](https://youtu.be/IB8kiHhZPJY) (1 min 52 s) | [▶ Watch the desktop walkthrough](https://youtu.be/h7pZu25kP7Q) (2 min 5 s) |
 | Facilitator and executive web app | Participant client with the AI assistant |
 
 Select a video to watch it on YouTube.

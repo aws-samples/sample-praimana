@@ -1,0 +1,26 @@
+# ⚠ THIS FILE HOLDS PNPM SETTINGS, NOT A WORKSPACE: `onlyBuiltDependencies` and the security `overrides`.
+#
+# pnpm 10 reads that list ONLY from pnpm-workspace.yaml — putting it in package.json logs "This will not take
+# effect" and silently skips the listed packages' install scripts. The desktop app carries the same file for
+# the same reason (electron's binary download and better-sqlite3's native build).
+#
+# `sharp` is Next's native image optimizer, and it is the ONE package here with an install script. Without
+# this file the install ends on "Ignored build scripts: sharp@0.34.5", which reads like a broken repo and is
+# not one — `next build` succeeds either way, falling back to Next's slower WASM optimizer at runtime.
+#
+# ⚠ sharp's build is APPROVED HERE DELIBERATELY. This repo installs for one
+# deployable app that serves images from `/public`, so the ~6s compile buys the fast path in production and a
+# warning-free install. Reverse it to `ignoredBuiltDependencies` if a build host cannot compile it.
+onlyBuiltDependencies:
+  - sharp
+
+# Moved from package.json, whose "pnpm" field pnpm 11 no longer reads.
+# Security pins for transitive dependencies. Changing one changes pnpm-lock.yaml.
+overrides:
+  "postcss": "8.5.26"
+  "js-yaml": "4.3.2"
+  "sharp": "0.35.5"
+  "brace-expansion@1": "1.1.21"
+  "brace-expansion@>=4": "5.0.12"
+  "source-map-js": "1.2.2"
+  "vite": "8.2.4"

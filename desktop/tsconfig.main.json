@@ -1,0 +1,22 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    // Vendored shared code — see README. Renamed with the product.
+    "paths": { "@praimana/shared": ["./shared/index.ts"] },
+    "target": "ES2022",
+    "module": "CommonJS",
+    "moduleResolution": "node",
+    // vite (vite-plugin-electron) produces the real main/preload bundles; this
+    // project is a type-check only, so noEmit avoids clobbering Vite's output.
+    // rootDir is src (not src/main) because we type-check both main and preload.
+    "noEmit": true,
+    // ⚠ "." NOT "src": the vendored shared/ folder sits beside src/; a rootDir of "src" makes tsc reject
+    // every file in it with TS6059.
+    "rootDir": ".",
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/main/**/*", "src/preload/**/*"],
+  "exclude": ["node_modules", "dist", "src/**/*.test.ts"]
+}

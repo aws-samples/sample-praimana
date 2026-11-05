@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Praimana - the App-account SES sending identity, a configuration set
+  attached to it as its default, and an SNS destination for bounce/complaint/reject events.
+  Consumed by platform-all-in-one.yaml through its EmailFrom parameter. Creates no IAM.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: The identity}
+        Parameters: [IdentityType, IdentityName]
+      - Label: {default: Delivery-event notification}
+        Parameters: [BounceNotificationEmail]
+      - Label: {default: Tagging}
+        Parameters: [Environment, ApplicationName, AutoDelete]
+
+Parameters:
+  KmsKeyArn:
+    Type: String
+    Description: >
+      ARN of the customer-managed KMS key from platform-kms.yaml (tier 0). REQUIRED, no
+      default. Enables a customer-managed KMS key for encryption at rest.
+
+      ⚠ REQUIRED RATHER THAN OPTIONAL ON PURPOSE. An optional key would mean wrapping every
+      encryption property in an Fn::If, and neither cfn_nag nor checkov can resolve an
+      intrinsic - the findings this exists to clear would stay open, exactly as W73 did for
+      the BillingMode parameter. A required parameter is the only shape that both encrypts
+      and closes the finding.
+
+      ⚠ Pass the full ARN, not a key id and not an alias: an alias can be repointed at a
+      different key without this stack changing.
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+$"
+    ConstraintDescription: Must be a full KMS key ARN from the tier-0 KMS stack.
+
+  IdentityType:
+    Type: String
+    Description: >
+      Domain verifies a whole domain and lets any address at it send - the only workable
+      choice for a no-reply@ sender, and the one that yields DKIM records to publish.
+      EmailAddress verifies exactly ONE mailbox by emailing it a confirmation link; it needs
+      no DNS, so it is the quick path for a smoke test. Declared explicitly rather than
+      inferred from the value because CloudFormation cannot test a string for "@", and
+      because the DKIM outputs below exist for one and not the other.
+    AllowedValues: ["Domain", "EmailAddress"]
+
+  IdentityName:
+    Type: String
+    Description: >
+      The domain (example.com) or the single mailbox (no-reply@example.com), matching
+      IdentityType. REQUIRED - there is no sensible default, and a wrong value here produces
+      an identity that never verifies rather than an error.
+    AllowedPattern: "^[A-Za-z0-9._%+-]+@?[A-Za-z0-9.-]+\\.[A-Za-z]{2,}$"
+    ConstraintDescription: >
+      Must be a domain (example.com) or an email address (no-reply@example.com).
+
+  BounceNotificationEmail:
+    Type: String
+    Description: >
+      Subscribed to the delivery-event topic, so bounces and complaints reach a human. EMPTY
+      creates the topic and the event destination but subscribes nobody - the events are
+      recorded and route nowhere, which is the same shape of failure as an unsubscribed
+      approval topic. Set it.
+    Default: ""
+
+  Environment:
+    Type: String
+    Description: >
+      Environment tag. REQUIRED, no default, for the reason the rest of the platform gives:
+      a wrong environment tag silently corrupts cost allocation.
+    AllowedValues: ["dev", "test", "staging", "prod", "shared"]
+
+  ApplicationName:
+    Type: String
+    Description: ApplicationName tag value.
+    Default: "Praimana"
+
+  AutoDelete:
+    Type: String
+    Description: Marks these resources as exempt from automated reaping.
+    Default: "never"
+
+Conditions:
+  IsDomain: !Equals [!Ref IdentityType, "Domain"]
+  HasBounceEmail: !Not [!Equals [!Ref BounceNotificationEmail, ""]]
+
+Resources:
+  DeliveryEventTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref KmsKeyArn
+      TopicName: !Sub "${AWS::StackName}-delivery-events"
+      DisplayName: Praimana SES delivery events
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: ApplicationName, Value: !Ref ApplicationName}
+        - {Key: auto-delete, Value: !Ref AutoDelete}
+
+  DeliveryEventTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref DeliveryEventTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSesPublish
+            Effect: Allow
+            Principal: {Service: ses.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref DeliveryEventTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref "AWS::AccountId"
+
+  DeliveryEventSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasBounceEmail
+    Properties:
+      TopicArn: !Ref DeliveryEventTopic
+      Protocol: email
+      Endpoint: !Ref BounceNotificationEmail
+
+  ConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub "${AWS::StackName}-config-set"
+      SuppressionOptions:
+        SuppressedReasons: [BOUNCE, COMPLAINT]
+      ReputationOptions:
+        ReputationMetricsEnabled: true
+      SendingOptions:
+        SendingEnabled: true
+
+  ConfigurationSetEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref ConfigurationSet
+      EventDestination:
+        Name: delivery-events-to-sns
+        Enabled: true
+        MatchingEventTypes: [BOUNCE, COMPLAINT, REJECT, RENDERING_FAILURE, DELIVERY_DELAY]
+        SnsDestination:
+          TopicARN: !Ref DeliveryEventTopic
+
+  EmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref IdentityName
+      DkimAttributes: !If
+        - IsDomain
+        - SigningEnabled: true
+        - !Ref "AWS::NoValue"
+      ConfigurationSetAttributes:
+        ConfigurationSetName: !Ref ConfigurationSet
+      FeedbackAttributes:
+        EmailForwardingEnabled: false
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: ApplicationName, Value: !Ref ApplicationName}
+        - {Key: auto-delete, Value: !Ref AutoDelete}
+
+Outputs:
+  IdentityArn:
+    Description: >
+      Pass as SesIdentityArn ONLY when the app stack runs in a DIFFERENT account from this
+      one. Same-account sending needs no delegation, and that is the normal case.
+    Value: !Sub "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${IdentityName}"
+
+  EmailFromHint:
+    Description: >
+      What to pass as the app stack's EmailFrom. For a domain identity any mailbox at it
+      works; for an address identity it must be that exact address.
+    Value: !If
+      - IsDomain
+      - !Sub "no-reply@${IdentityName}"
+      - !Ref IdentityName
+
+  ConfigurationSetName:
+    Description: Attached to the identity as its default; no code references it by name.
+    Value: !Ref ConfigurationSet
+
+  DeliveryEventTopicArn:
+    Description: >
+      Subscribe a chat channel or ticket queue here if email is the wrong destination for
+      bounce and complaint events.
+    Value: !Ref DeliveryEventTopic
+
+  DkimRecord1:
+    Condition: IsDomain
+    Description: Publish as a CNAME. The identity does not verify until all three resolve.
+    Value: !Sub "${EmailIdentity.DkimDNSTokenName1} CNAME ${EmailIdentity.DkimDNSTokenValue1}"
+
+  DkimRecord2:
+    Condition: IsDomain
+    Description: Publish as a CNAME.
+    Value: !Sub "${EmailIdentity.DkimDNSTokenName2} CNAME ${EmailIdentity.DkimDNSTokenValue2}"
+
+  DkimRecord3:
+    Condition: IsDomain
+    Description: Publish as a CNAME.
+    Value: !Sub "${EmailIdentity.DkimDNSTokenName3} CNAME ${EmailIdentity.DkimDNSTokenValue3}"

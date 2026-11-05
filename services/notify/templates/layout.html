@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="x-apple-disable-message-reformatting" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <title>{{title}}</title>
+    <!--[if mso]>
+      <style>
+        table, td, div, h1, p { font-family: Arial, sans-serif; }
+      </style>
+    <![endif]-->
+  </head>
+  <body style="margin:0;padding:0;width:100%;background:#eef0f5;-webkit-font-smoothing:antialiased;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
+    <!-- Preheader: the preview snippet shown in the inbox list, hidden in the body. -->
+    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;height:0;width:0;">{{preheader}}</div>
+    <div style="display:none;max-height:0;overflow:hidden;">&#8199;&#65279;&#847;&#8199;&#65279;&#847;&#8199;&#65279;&#847;&#8199;&#65279;&#847;&#8199;&#65279;&#847;&#8199;&#65279;&#847;</div>
+
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#eef0f5;">
+      <tr>
+        <td align="center" style="padding:32px 16px;">
+          <table role="presentation" width="520" cellpadding="0" cellspacing="0" style="width:520px;max-width:100%;">
+            <!-- Brand header -->
+            <tr>
+              <td style="padding:4px 8px 20px;">
+                <table role="presentation" cellpadding="0" cellspacing="0">
+                  <tr>
+                    <!-- A typographic wordmark, with NO logo image and no monogram
+                         tile. The "A" tile that used to sit here was a placeholder
+                         for the real product logo, and it was the wrong mark: the
+                         product's actual logo is the one the portal and the desktop
+                         app render.
+
+                         The real logo is deliberately NOT used here either, because
+                         an emailed image has to be an absolute https URL and most
+                         clients block remote images until the recipient opts in.
+                         That would leave the majority of recipients looking at a
+                         broken-image box or alt text — strictly worse than a clean
+                         wordmark, which renders identically for everyone and needs
+                         no image loading at all. If a hosted logo is wanted later it
+                         needs a real, stable public URL (see the notify README) and
+                         must stay purely decorative: the wordmark below already
+                         names the product, so nothing may depend on the image. -->
+                    <td style="vertical-align:middle;">
+                      <span style="font-size:16px;font-weight:700;color:#1f2937;letter-spacing:-0.2px;">{{productName}}</span>
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <!-- Card -->
+            <tr>
+              <td style="background:#ffffff;border-radius:16px;border:1px solid #e5e7eb;box-shadow:0 1px 2px rgba(16,24,40,0.04);overflow:hidden;">
+                <!-- Accent bar. Solid background-color underneath, gradient only as
+                     decoration on top — the same rule the call-to-action buttons
+                     follow, and the one routes.test.ts pins. Here a stripped
+                     gradient merely lost the bar (nothing became invisible), but
+                     the failure mode is identical. -->
+                <!-- font-size/line-height:0 keep the &nbsp; from inflating a 4px
+                     bar; the space itself is there because some clients collapse a
+                     truly empty element away. -->
+                <div style="height:4px;font-size:0;line-height:0;background-color:#4f46e5;background-image:linear-gradient(90deg,#6366f1,#8b5cf6,#4f46e5);">&nbsp;</div>
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0">
+                  <tr>
+                    <td style="padding:32px 36px 8px;">
+                      <!-- Intentionally raw. `content` is a partial already
+                           rendered by render.ts (every user field escaped via
+                           the escaped double-brace form). Code-enforced: the
+                           triple-brace raw slot below emits raw ONLY for a
+                           SafeHtml marker; templates.ts markSafe()s this
+                           server-produced value. A plain string here (e.g. stray
+                           caller input) is escaped, not injected. -->
+                      {{{content}}} <!-- nosemgrep: template-explicit-unescape -->
+                    </td>
+                  </tr>
+                </table>
+              </td>
+            </tr>
+
+            <!-- Footer -->
+            <tr>
+              <td style="padding:24px 20px 8px;text-align:center;color:#9ca3af;font-size:12px;line-height:1.7;">
+                <!-- Intentionally raw. `footerExtra` is trusted server markup
+                     (defaults to "" in templates.ts). Code-enforced: templates.ts
+                     markSafe()s it; the triple-brace raw slot guard escapes any
+                     non-SafeHtml value, so stray caller input here is escaped,
+                     not injected. -->
+                {{{footerExtra}}} <!-- nosemgrep: template-explicit-unescape -->
+                <p style="margin:8px 0 0;">You're receiving this because you're part of a workshop on {{productName}}.</p>
+                <p style="margin:4px 0 0;">&copy; {{year}} {{productName}}.</p>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
+    </table>
+  </body>
+</html>

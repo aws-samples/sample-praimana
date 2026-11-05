@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    Hardened-runtime entitlements for notarization. Each one is an EXCEPTION to a protection
+    Apple applies by default, so the list is kept to what Electron and this app actually need.
+
+    ── ⚠ TWO ENTITLEMENTS WERE REMOVED, AND WHY THEY WERE HERE ─────────────────────────────
+
+    `com.apple.security.cs.disable-library-validation` and
+    `com.apple.security.cs.allow-dyld-environment-variables` used to be granted, justified by the
+    comment "the app spawns CLI assistants and a login shell (node-pty)".
+
+    That justification had expired. node-pty and the entire PTY surface are gone with the embedded
+    terminal (see the note in scripts/rebuild-native.sh), and spawning a child process never
+    required either entitlement in the first place — `com.apple.security.inherit` below is what
+    covers that.
+
+    What they cost while they were here: `disable-library-validation` lets a dylib signed by
+    someone else — or not signed at all — load into this notarized, signed process, and
+    `allow-dyld-environment-variables` makes `DYLD_INSERT_LIBRARIES` effective against it. In
+    combination they remove most of what hardened runtime buys, and they persist in the shipped
+    signature, so a local attacker gains code execution inside a signed, notarized app that the
+    user has already granted TCC permissions to.
+
+    ⚠ WHAT MUST STILL BE VERIFIED IN A SIGNED BUILD, because it cannot be checked locally:
+    removing `disable-library-validation` means every Mach-O in the bundle must be signed with the
+    SAME Team ID. The only native module here is better-sqlite3's `prebuilds/darwin-*.node`, which
+    electron-builder signs along with the rest of the bundle, so this is expected to be fine — but
+    "expected" is not "verified", and the failure mode is specific and easy to spot: the app
+    launches, then dies the moment it first touches the database, with a code-signature or
+    "library load disallowed" error rather than a SQLite one.
+
+    Check after signing:
+      codesign -d --entitlements - "dist/mac-arm64/Praimana.app"
+      codesign -vvv --deep --strict "dist/mac-arm64/Praimana.app"
+    then launch the signed app once and open any screen that reads data.
+  -->
+
+  <!-- V8 compiles JavaScript at runtime; without this the renderer cannot start. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+
+  <!--
+    Electron still needs writable-executable pages beyond what allow-jit covers. Kept because
+    removing it breaks the app rather than because it is harmless: it is the weaker of the two
+    JIT exceptions and should be dropped if a future Electron no longer requires it.
+  -->
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+
+  <!--
+    Child processes (the CLI assistants, git) inherit this signature's entitlements instead of
+    being refused. THIS is what "the app spawns CLI assistants" actually requires.
+  -->
+  <key>com.apple.security.inherit</key>
+  <true/>
+</dict>
+</plist>

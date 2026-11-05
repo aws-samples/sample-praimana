@@ -1,0 +1,976 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Praimana - the App-account observability tier: twelve alarms, the alerts topic
+  and up to five email subscriptions, the liveness canary and the platform dashboard. A strict
+  leaf - nothing else depends on it.
+
+Parameters:
+  KmsKeyArn:
+    Type: String
+    Description: >
+      ARN of the customer-managed KMS key from platform-kms.yaml (tier 0). REQUIRED, no
+      default. Enables a customer-managed KMS key for encryption at rest.
+
+      ⚠ REQUIRED RATHER THAN OPTIONAL ON PURPOSE. An optional key would mean wrapping every
+      encryption property in an Fn::If, and neither cfn_nag nor checkov can resolve an
+      intrinsic - the findings this exists to clear would stay open, exactly as W73 did for
+      the BillingMode parameter. A required parameter is the only shape that both encrypts
+      and closes the finding.
+
+      ⚠ Pass the full ARN, not a key id and not an alias: an alias can be repointed at a
+      different key without this stack changing.
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+$"
+    ConstraintDescription: Must be a full KMS key ARN from the tier-0 KMS stack.
+
+  Environment:
+    Type: String
+    Description: >
+      Environment tag. REQUIRED, no default - a wrong environment tag silently corrupts cost
+      allocation.
+    AllowedValues: ["dev", "test", "staging", "prod", "shared"]
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^[^\s,]+@[^\s,]+(,[^\s,]+@[^\s,]+)*$'
+
+    ConstraintDescription: >-
+      must be empty, one email address, or several separated by commas with NO SPACES
+      (e.g. ops@example.com,oncall@example.com)
+    Description: >-
+      Where CloudWatch alarms are DELIVERED. Every alarm in this stack used to have no
+      AlarmActions at all, so all four evaluated, changed state, and told nobody —
+      console artefacts rather than pages, useful only to someone who already thought
+      to look. This is the parameter that closes that.
+
+      A PARAMETER WITH NO DEFAULT, not a hardcoded address: an operator mailbox is
+      deployment topology, it differs per environment, and a real human address does not
+      belong in a tracked file. EMPTY means the topic is still created and all four
+      alarms still publish to it — so wiring is deployed and verifiable — but nothing is
+      subscribed, and therefore nothing is delivered. That is a deliberate middle state:
+      it lets the plumbing be reviewed and the topic be subscribed later from the
+      console without a stack update.
+
+      ⚠ SUBSCRIBING IS NOT COMPLETE ON DEPLOY. SNS emails each address a confirmation
+      link that a HUMAN must click; until then the subscription sits PendingConfirmation
+      and delivers nothing. So a green stack update is NOT evidence that alarms reach
+      anyone — check the subscription state, which is exactly what the deploy runbook
+      says to verify. With several addresses, EACH ONE needs its own click.
+
+      ── ⚠ ONE OR MORE ADDRESSES, COMMA-SEPARATED, NO SPACES ──
+
+      "ops@example.com" or "ops@example.com,oncall@example.com,lead@example.com". Up to
+      FIVE are subscribed (see AlertsEmailSubscription1..5).
+
+      ⚠ THE NAME STAYED SINGULAR ON PURPOSE. Renaming it to AlertEmails would have been
+      tidier and would have SILENTLY UNSUBSCRIBED the live recipient: `aws cloudformation
+      deploy` sends UsePreviousValue only for parameters that still EXIST, so a renamed
+      parameter takes its default — "" — and the existing subscription is deleted. A
+      single address remains a valid one-element list, so widening in place costs nothing
+      and risks nothing.
+
+      ⚠ NO SPACES AFTER THE COMMAS. " oncall@example.com" is subscribed verbatim, leading
+      space included, and then delivers to nobody while looking correct in the console.
+      The AllowedPattern below refuses it at change-set time rather than letting it
+      deploy — a validation that exists because the failure is invisible.
+
+      ⚠ FIVE IS A CEILING IMPOSED BY CLOUDFORMATION, NOT A PRODUCT DECISION. There is no
+      loop: each subscription must be its own declared resource. For a wider audience,
+      subscribe a DISTRIBUTION LIST — one address here, membership managed where group
+      membership belongs, and no stack update when the on-call rota changes.
+
+      Unrelated to EmailFrom / EmailReplyTo, which are the NOTIFY service's SES
+      transport for product email (invitations). This is operational alerting over SNS
+      and shares nothing with them: no SES verification is needed for an SNS
+      subscription.
+
+  EnableCanary:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Create the liveness canary, its artifact bucket, its role and its alarm.
+
+      DEFAULT true, because "is the platform up?" currently has no answer that does not involve
+      asking a participant — and for a product used in time-boxed live workshops, where the whole
+      audience is in one room for one day, a 20-minute unnoticed outage is a material fraction of
+      the event. It is a parameter at all so a customer can decline the cost (see CanaryRate).
+
+  CanaryRate:
+    Type: String
+    Default: "rate(5 minutes)"
+    AllowedValues: ["rate(1 minute)", "rate(5 minutes)", "rate(15 minutes)"]
+    Description: >-
+      How often the liveness canary runs.
+
+      ⚠ THIS IS THE COST DECISION. Canary runs are billed
+      individually (100/month free, then ~$0.0012 per run at us-east-1 pricing when this was
+      written), so:
+
+        rate(1 minute)   ≈ 43,200 runs/month  ≈ $52/month   — detects in ~2 min
+        rate(5 minutes)  ≈  8,640 runs/month  ≈ $10/month   — detects in ~10 min
+        rate(15 minutes) ≈  2,880 runs/month  ≈  $3/month   — detects in ~30 min
+
+      The alarm needs TWO consecutive failures (one is a blip, two is an outage), so detection time
+      is roughly twice the rate. The figures above are the ones to plan with; check current
+      CloudWatch Synthetics pricing for your Region.
+
+      5 minutes is the default because it closes the gap for a tenth of the price. ⚠ TURN IT TO
+      rate(1 minute) FOR AN EVENT DAY — that is one parameter on one stack update, and on the day
+      itself a ten-minute blind spot is the expensive one.
+
+  CanaryBaseUrl:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^https://[A-Za-z0-9.-]+(:[0-9]+)?(/[A-Za-z0-9._~/-]*)?$"
+    ConstraintDescription: >
+      Must be empty, or an https:// URL with no trailing slash and no query string.
+    Description: >-
+      Base URL the canary probes, with no trailing slash. EMPTY means the API Gateway invoke URL for
+      this stack's own HTTP API, which is always correct and needs no configuration.
+
+      ⚠ SET IT TO THE CUSTOM DOMAIN IF ONE IS IN USE, because the invoke URL does not exercise the
+      domain name, its ACM certificate or its API mapping — and a lapsed certificate takes the
+      platform down for every real client while a canary on the invoke URL stays green. That is a
+      known, deliberate blind spot of the default rather than an oversight.
+
+  ApiId:
+    Type: String
+    Description: >
+      ApiId output of platform-api.yaml. Used as the ApiId dimension on the edge alarms and in
+      six dashboard widgets.
+    AllowedPattern: "^[a-z0-9]{8,20}$"
+    ConstraintDescription: Must be an API Gateway HTTP API id.
+
+  CanaryArtifactsBucketName:
+    Type: String
+    Description: >
+      CanaryArtifactsBucketName output of platform-plumbing.yaml. Where each canary run writes
+      its HAR/log bundle. Interpolated into the canary role's S3 ARN, so the pattern is scoping.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid S3 bucket name.
+
+  DeadLetterQueueName:
+    Type: String
+    Description: >
+      Queue NAME (not ARN) from platform-plumbing.yaml - CloudWatch's SQS dimension takes the
+      name. Used by DeadLetterQueueNotEmptyAlarm and one dashboard widget.
+    AllowedPattern: "^[A-Za-z0-9_-]{1,80}$"
+    ConstraintDescription: Must be an SQS queue name.
+
+Conditions:
+  CanaryEnabled: !Equals [!Ref EnableCanary, "true"]
+  HasCanaryBaseUrl: !Not [!Equals [!Ref CanaryBaseUrl, ""]]
+  HasAlertEmail:  !Not [!Equals [!Ref AlertEmail, ""]]
+  HasAlertEmail2: !Not [!Equals [!Select [1, !Split [",", !Sub "${AlertEmail},,,,"]], ""]]
+  HasAlertEmail3: !Not [!Equals [!Select [2, !Split [",", !Sub "${AlertEmail},,,,"]], ""]]
+  HasAlertEmail4: !Not [!Equals [!Select [3, !Split [",", !Sub "${AlertEmail},,,,"]], ""]]
+  HasAlertEmail5: !Not [!Equals [!Select [4, !Split [",", !Sub "${AlertEmail},,,,"]], ""]]
+
+Resources:
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      KmsMasterKeyId: !Ref KmsKeyArn
+      TopicName: praimana-alerts
+      DisplayName: Praimana alerts
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Select [0, !Split [",", !Sub "${AlertEmail},,,,"]]
+
+  AlertsEmailSubscription2:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail2
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Select [1, !Split [",", !Sub "${AlertEmail},,,,"]]
+
+  AlertsEmailSubscription3:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail3
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Select [2, !Split [",", !Sub "${AlertEmail},,,,"]]
+
+  AlertsEmailSubscription4:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail4
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Select [3, !Split [",", !Sub "${AlertEmail},,,,"]]
+
+  AlertsEmailSubscription5:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail5
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Select [4, !Split [",", !Sub "${AlertEmail},,,,"]]
+
+  KeyLifecycleAlarmRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: praimana-kms-key-lifecycle
+      Description: >-
+        Pages when anyone schedules deletion of, disables, or re-policies the platform KMS key.
+        ScheduleKeyDeletion is the one that destroys data irrecoverably when its window expires.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.kms
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - kms.amazonaws.com
+          eventName:
+            - ScheduleKeyDeletion
+            - DisableKey
+            - PutKeyPolicy
+            - DisableKeyRotation
+            - CancelKeyDeletion
+      Targets:
+        - Id: AlertsTopic
+          Arn: !Ref AlertsTopic
+
+  AlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref AlertsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEventBridgePublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+          - Sid: AllowCloudWatchAlarmsPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref AlertsTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:praimana-*"
+
+  ApiServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-api-5xx
+      AlarmDescription: >-
+        The edge API is returning server errors. Baseline is 1 in 21,973 requests over 7 days, so 5
+        in five minutes is abnormal rather than noise. This is the GATEWAY's view, so it catches an
+        integration failure or a crashed function that a service log would not. RUNBOOK: (1) Query
+        /praimana/api-access in Insights, filter status>=500, group by routeKey — that names
+        the route and carries integrationErrorMessage. (2) Read the matching
+        /praimana/<service> group around the same requestId. (3) If the routes span several
+        services, suspect a shared dependency (DynamoDB, Cognito) rather than a service. (4) A 5xx
+        storm with FLAT Lambda Errors means the failure is in the gateway or integration, not the code.
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref ApiId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  ApiLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-api-latency-p99
+      AlarmDescription: >-
+        The edge API's p99 latency is above 5 seconds for 15 minutes. p99 rather than an average,
+        because an average hides the tail a participant actually experiences. 5s is the stated p99.9
+        budget and sits below the 15s function timeout with room for a cold east-west hop (measured
+        1802ms). RUNBOOK: (1) The dashboard's per-service Duration widget shows WHICH service. (2)
+        If one is slow and the others are not, read its group for the east-west timeout message — a
+        callee brownout surfaces as latency in the CALLER. (3) If ALL are slow, suspect DynamoDB or a
+        cold-start storm after a deploy. (4) Sustained latency near 15s produces hard cuts
+        mid-request, which look like data loss rather than slowness.
+      Namespace: AWS/ApiGateway
+      MetricName: Latency
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref ApiId
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-lambda-throttled
+      AlarmDescription: >-
+        A Lambda invocation was THROTTLED — the platform hit its concurrency ceiling and requests
+        were rejected before running. ⚠ THIS IS THE ONE ALARM WHOSE THRESHOLD IS 1: a throttle is
+        never normal here, because the gateway is capped at 200 rps precisely so
+        concurrency cannot be exhausted. It means the cap was raised, a function is holding
+        connections far longer than expected, or ANOTHER WORKLOAD IN THIS ACCOUNT is consuming the
+        shared 1,000 concurrency. RUNBOOK: (1) The dashboard's Throttles widget names the function.
+        (2) Compare ConcurrentExecutions with the account limit. (3) Look for a NON-PLATFORM function
+        in this account first — the limit is account-wide, so a neighbour can starve this platform.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-lambda-errors
+      AlarmDescription: >-
+        Lambda invocations are FAILING across the platform — an unhandled throw, an out-of-memory or
+        a timeout. Account-wide so one alarm covers all fifteen; the dashboard names which. Baseline
+        over 7 days is ZERO, so 5 in five minutes is a real regression. ⚠ IT CANNOT SEE A FAIL-CLOSED
+        REFUSAL: TEAM_SCOPE_UNAVAILABLE and friends are SUCCESSFUL invocations returning a 503 body,
+        so this stays FLAT through a dependency outage that refuses every user — see
+        a per-service error alarm. RUNBOOK: (1) Dashboard Errors widget for the
+        function. (2) Its /praimana/<service> group, filter ERROR. (3) If it began at a deploy,
+        the release version is on the function configuration.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  CanaryRole:
+    Type: AWS::IAM::Role
+    Condition: CanaryEnabled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >-
+              Irreducible: the AWS APIs for these actions take NO resource ARN and IAM rejects
+              anything but '*' (dynamodb:ListStreams, cloudwatch:DescribeAlarms, Cost Explorer
+              reads, s3:ListAllMyBuckets, cloudwatch:PutMetricData). Verified by experiment, not
+              assumption - iam simulate said an ARN-scoped resource would work and the live call
+              returned AccessDenied regardless. Each is already narrowed by a query filter or an
+              IAM condition wherever the API permits.
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: !Sub "praimana-canary-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: canary-run
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:PutObject, s3:GetBucketLocation]
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::${CanaryArtifactsBucketName}/*"
+                  - !Sub "arn:${AWS::Partition}:s3:::${CanaryArtifactsBucketName}"
+              - Effect: Allow
+                Action: s3:ListAllMyBuckets
+                Resource: "*"
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cwsyn-*"
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals: { "cloudwatch:namespace": CloudWatchSynthetics }
+      Tags:
+        - { Key: ApplicationName, Value: Praimana }
+
+  HealthCanary:
+    Type: AWS::Synthetics::Canary
+    Condition: CanaryEnabled
+    Properties:
+      Name: praimana-live
+      RuntimeVersion: syn-nodejs-5.2
+      ExecutionRoleArn: !GetAtt CanaryRole.Arn
+      ArtifactS3Location: !Sub "s3://${CanaryArtifactsBucketName}"
+      StartCanaryAfterCreation: true
+      DeleteLambdaResourcesOnCanaryDeletion: true
+      Schedule:
+        Expression: !Ref CanaryRate
+      RunConfig:
+        TimeoutInSeconds: 45
+        MemoryInMB: 960
+        ActiveTracing: false
+        EnvironmentVariables:
+          CANARY_BASE_URL: !If
+            - HasCanaryBaseUrl
+            - !Ref CanaryBaseUrl
+            - !Sub "https://${ApiId}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+      Code:
+        Handler: index.handler
+        Script: |
+            const https = require("node:https");
+
+            /**
+             * WHAT EACH CHECK PROVES. This is the whole value of the canary, so it is written down
+             * next to the code rather than in a wiki nobody opens at 9am on event day.
+             *
+             *  1. GET /v1/auth/config  -> 200 AND a Cognito issuer in the body.
+             *     Proves the edge, the JWT authorizer's bypass path, the identity Lambda and its
+             *     configuration. Asserting the ISSUER rather than only the status is the point: if
+             *     COGNITO_ISSUER were ever lost the route still answers 200 with "", and every
+             *     front-end would be unable to start a sign-in while a status-only check stayed green.
+             *
+             *  2. GET /v1/invitations/lookup-by-token?token=<sentinel>  -> 404.
+             *     Proves the TEAM service and a REAL DynamoDB READ: the route hashes the token and
+             *     Queries the tokenHash-index, so a 404 means the store answered. This is the only
+             *     check that reaches past a Lambda into a table, and it does so with no credentials
+             *     and no side effect.
+             *     A 200 would mean the sentinel matched a real invitation and is treated as a
+             *     FAILURE — that would be a token collision, which is worth waking somebody for.
+             *
+             *  3. GET /v1/auth/me with NO Authorization header  -> 401.
+             *     Proves the authorizer is still REFUSING. This is a security invariant, not a
+             *     liveness one: if it ever returns 200 or 500 the gateway has broken OPEN and every
+             *     participant's profile is exposed. Nothing else on this platform would notice, and
+             *     it costs one request to check.
+             */
+            // Supplied by RunConfig.EnvironmentVariables, never interpolated into this file.
+            const BASE = process.env.CANARY_BASE_URL;
+            if (!BASE) throw new Error("CANARY_BASE_URL is not set - the canary cannot probe anything");
+
+            /** A token that cannot be a real invite. Hashed before lookup, so nothing is injectable. */
+            const SENTINEL = "canary-liveness-probe-not-a-real-invite-token";
+
+            function get(path, headers) {
+              return new Promise((resolve, reject) => {
+                const url = new URL(BASE + path);
+                const req = https.request(
+                  {
+                    hostname: url.hostname,
+                    path: url.pathname + url.search,
+                    method: "GET",
+                    // Below the 45s run timeout so a hung dependency fails THIS check with a clear
+                    // message instead of killing the whole run with an opaque one.
+                    timeout: 10000,
+                    headers: { "user-agent": "praimana-liveness-canary", ...headers },
+                  },
+                  (res) => {
+                    let body = "";
+                    // Bounded: a probe must not be the thing that runs out of memory.
+                    res.on("data", (chunk) => {
+                      if (body.length < 8192) body += chunk;
+                    });
+                    res.on("end", () => resolve({ status: res.statusCode, body }));
+                  }
+                );
+                req.on("timeout", () => req.destroy(new Error("timed out after 10s")));
+                req.on("error", reject);
+                req.end();
+              });
+            }
+
+            /**
+             * ⚠ HOW MANY CHECKS RAN IS ITSELF ASSERTED. The authorizer check below is a security
+             * tripwire, and SuccessPercent cannot tell "the assertion passed" from "the assertion
+             * is no longer there" - both are 100. So every check increments this, and the handler
+             * fails if the count is not what it should be. Deleting or short-circuiting a check
+             * now turns the canary RED instead of leaving its alarm green over nothing.
+             *
+             * Deliberately a counter rather than a PutMetricData call per check: the template
+             * already commits to the runtime-independent "throw to fail, return to succeed"
+             * contract, and requiring an SDK import would make the canary itself breakable by a
+             * runtime upgrade.
+             */
+            const EXPECTED_CHECKS = 3;
+            let ran = 0;
+
+            /** Every failure message names the CHECK, the EXPECTATION and the URL. */
+            async function check(name, path, expected, headers, assertBody) {
+              let res;
+              try {
+                res = await get(path, headers);
+              } catch (err) {
+                throw new Error(`${name}: no response from ${BASE}${path} — ${err.message}`);
+              }
+              if (res.status !== expected) {
+                throw new Error(
+                  `${name}: expected ${expected} from ${path}, got ${res.status}`
+                );
+              }
+              if (assertBody) assertBody(res.body);
+              ran += 1;
+              console.log(`${name}: ok (${res.status})`);
+            }
+
+            exports.handler = async () => {
+              // ⚠ RESET PER INVOCATION, AND THE ABSENCE OF THIS LINE FAILED EVERY WARM RUN.
+              // `ran` is declared at module scope so `check()` can close over it, and Lambda
+              // reuses a warm execution environment across invocations - so it accumulated
+              // instead of resetting: 3 on the cold start (pass), then 6, 9, 12 (fail), with
+              // the guard reporting "only 12 of 3 checks ran". That reads as a canary that
+              // lost a check, i.e. an outage, when in fact the platform was answering all
+              // three every time. Observed live: three consecutive FAILED runs at 6, 9 and 12
+              // while /v1/workshops was correctly returning 401.
+              ran = 0;
+
+              await check("edge+identity", "/v1/auth/config", 200, {}, (body) => {
+                let parsed;
+                try {
+                  parsed = JSON.parse(body);
+                } catch {
+                  throw new Error("edge+identity: /v1/auth/config did not return JSON");
+                }
+                if (!String(parsed.issuer || "").startsWith("https://cognito-idp.")) {
+                  throw new Error(
+                    "edge+identity: config answered 200 with no Cognito issuer — sign-in is broken"
+                  );
+                }
+              });
+
+              await check(
+                "team+dynamodb",
+                `/v1/invitations/lookup-by-token?token=${encodeURIComponent(SENTINEL)}`,
+                404
+              );
+
+              // ⚠ 401 IS THE PASS CONDITION HERE. Anything else means the authorizer is not refusing.
+              await check("authorizer-refuses", "/v1/auth/me", 401);
+
+              if (ran !== EXPECTED_CHECKS) {
+                throw new Error(
+                  `only ${ran} of ${EXPECTED_CHECKS} checks ran - a check was removed or skipped, ` +
+                    "so this canary is no longer proving what its alarm claims"
+                );
+              }
+
+              return `platform is answering (${ran}/${EXPECTED_CHECKS} checks): edge, identity, team, dynamodb, authorizer`;
+            };
+      Tags:
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: auto-delete, Value: never }
+
+  CanaryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CanaryEnabled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-canary-failed
+      AlarmDescription: >-
+        THE PLATFORM IS NOT ANSWERING FROM OUTSIDE. Two consecutive canary runs failed. ⚠ THIS IS THE
+        ONLY ALARM THAT WOULD FIRE IF THE PLATFORM STOPPED RESPONDING ALTOGETHER — every other alarm
+        watches a symptom the platform reports about ITSELF, so a dead platform reports nothing and
+        they all stay OK. RUNBOOK: (1) The canary's run log names which of the three checks failed and
+        what it expected. (2) "edge+identity" — the gateway or the identity function; check API 5xx and
+        that route's integration. (3) "team+dynamodb" — the team function or the invitations table; a
+        503 here means a coded refusal, so check FailClosedRefusals too. (4) "authorizer-refuses" is a
+        SECURITY failure, not an availability one: the gateway returned something other than 401 to an
+        unauthenticated request, so treat every route as exposed until proven otherwise. (5) Nothing
+        failing but the alarm red means the canary itself broke — check its role and the artifact
+        bucket before assuming an outage.
+      Namespace: CloudWatchSynthetics
+      MetricName: SuccessPercent
+      Dimensions:
+        - Name: CanaryName
+          Value: !Ref HealthCanary
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 100
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  PlatformDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: praimana
+      DashboardBody: !Sub
+        - |
+          {"widgets":[{"type":"text","x":0,"y":0,"width":24,"height":2,"properties":{"markdown":"## Is it up?\nRequest rate, refusals and server errors at the edge. **A flat 5xx line with users complaining means a FAIL-CLOSED refusal (503 with a code) — those are successful invocations and do not appear as errors here.**"}},{"type":"metric","x":0,"y":2,"width":6,"height":6,"properties":{"title":"Canary — is it up? (blank if EnableCanary=false)","region":"us-east-1","period":300,"metrics":[["CloudWatchSynthetics","SuccessPercent","CanaryName","praimana-live",{"stat":"Average","label":"success %"}]],"yAxis":{"left":{"min":0,"max":100}},"annotations":{"horizontal":[{"label":"any failure","value":100}]}}},{"type":"metric","x":6,"y":2,"width":6,"height":6,"properties":{"title":"Requests","region":"us-east-1","stat":"Sum","period":300,"metrics":[["AWS/ApiGateway","Count","ApiId","${ApiId}"]]}},{"type":"metric","x":12,"y":2,"width":6,"height":6,"properties":{"title":"4xx vs 5xx","region":"us-east-1","stat":"Sum","period":300,"metrics":[["AWS/ApiGateway","4xx","ApiId","${ApiId}",{"label":"4xx (refused)"}],["AWS/ApiGateway","5xx","ApiId","${ApiId}",{"label":"5xx (broken)"}]]}},{"type":"metric","x":18,"y":2,"width":6,"height":6,"properties":{"title":"Latency p50 / p99 (ms)","region":"us-east-1","period":300,"metrics":[["AWS/ApiGateway","Latency","ApiId","${ApiId}",{"stat":"p50","label":"p50"}],["AWS/ApiGateway","Latency","ApiId","${ApiId}",{"stat":"p99","label":"p99"}],["AWS/ApiGateway","IntegrationLatency","ApiId","${ApiId}",{"stat":"p99","label":"integration p99"}]],"annotations":{"horizontal":[{"label":"p99 budget 2s","value":2000},{"label":"alarm 5s","value":5000}]}}},{"type":"metric","x":0,"y":8,"width":12,"height":6,"properties":{"title":"Fail-closed refusals by code (503s Lambda Errors cannot see)","region":"us-east-1","period":300,"stat":"Sum","view":"timeSeries","metrics":[[{"expression":"SEARCH('{Praimana/FailClosed,Code,Service} MetricName=\"FailClosedRefusals\"', 'Sum', 300)","id":"e1","label":""}]]}},{"type":"metric","x":12,"y":8,"width":12,"height":6,"properties":{"title":"Bedrock refusals by reason (insights generation)","region":"us-east-1","period":900,"stat":"Sum","view":"timeSeries","metrics":[[{"expression":"SEARCH('{Praimana/Bedrock,Reason} MetricName=\"BedrockRefusals\"', 'Sum', 900)","id":"e2","label":""}]]}},{"type":"text","x":0,"y":14,"width":24,"height":2,"properties":{"markdown":"## Is it healthy?\nPer-service errors and throttles, the async paths, and the five domain-invariant alarms. **Alarm states are here on purpose: a dashboard that does not show whether the alarms are OK invites the assumption that silence means health.**"}},{"type":"metric","x":0,"y":16,"width":8,"height":6,"properties":{"title":"Errors by service","region":"us-east-1","period":300,"metrics":[["AWS/Lambda","Errors","FunctionName","praimana-ai",{"stat":"Sum","label":"ai"}],["AWS/Lambda","Errors","FunctionName","praimana-team",{"stat":"Sum","label":"team"}],["AWS/Lambda","Errors","FunctionName","praimana-evaluation",{"stat":"Sum","label":"evaluation"}],["AWS/Lambda","Errors","FunctionName","praimana-collaboration",{"stat":"Sum","label":"collaboration"}],["AWS/Lambda","Errors","FunctionName","praimana-workshop",{"stat":"Sum","label":"workshop"}],["AWS/Lambda","Errors","FunctionName","praimana-docs",{"stat":"Sum","label":"docs"}],["AWS/Lambda","Errors","FunctionName","praimana-identity",{"stat":"Sum","label":"identity"}],["AWS/Lambda","Errors","FunctionName","praimana-source",{"stat":"Sum","label":"source"}],["AWS/Lambda","Errors","FunctionName","praimana-desktop",{"stat":"Sum","label":"desktop"}],["AWS/Lambda","Errors","FunctionName","praimana-notify",{"stat":"Sum","label":"notify"}],["AWS/Lambda","Errors","FunctionName","praimana-user-access",{"stat":"Sum","label":"user-access"}],["AWS/Lambda","Errors","FunctionName","praimana-user-projection",{"stat":"Sum","label":"user-projection"}],["AWS/Lambda","Errors","FunctionName","praimana-bulk-provision",{"stat":"Sum","label":"bulk-provision"}],["AWS/Lambda","Errors","FunctionName","praimana-cognito-presignup",{"stat":"Sum","label":"cognito-presignup"}],["AWS/Lambda","Errors","FunctionName","praimana-cognito-postconfirmation",{"stat":"Sum","label":"cognito-postconfirmation"}]]}},{"type":"metric","x":8,"y":16,"width":8,"height":6,"properties":{"title":"Throttles by service (any is abnormal)","region":"us-east-1","period":300,"metrics":[["AWS/Lambda","Throttles","FunctionName","praimana-ai",{"stat":"Sum","label":"ai"}],["AWS/Lambda","Throttles","FunctionName","praimana-team",{"stat":"Sum","label":"team"}],["AWS/Lambda","Throttles","FunctionName","praimana-evaluation",{"stat":"Sum","label":"evaluation"}],["AWS/Lambda","Throttles","FunctionName","praimana-collaboration",{"stat":"Sum","label":"collaboration"}],["AWS/Lambda","Throttles","FunctionName","praimana-workshop",{"stat":"Sum","label":"workshop"}],["AWS/Lambda","Throttles","FunctionName","praimana-docs",{"stat":"Sum","label":"docs"}],["AWS/Lambda","Throttles","FunctionName","praimana-identity",{"stat":"Sum","label":"identity"}],["AWS/Lambda","Throttles","FunctionName","praimana-source",{"stat":"Sum","label":"source"}],["AWS/Lambda","Throttles","FunctionName","praimana-desktop",{"stat":"Sum","label":"desktop"}],["AWS/Lambda","Throttles","FunctionName","praimana-notify",{"stat":"Sum","label":"notify"}],["AWS/Lambda","Throttles","FunctionName","praimana-user-access",{"stat":"Sum","label":"user-access"}],["AWS/Lambda","Throttles","FunctionName","praimana-user-projection",{"stat":"Sum","label":"user-projection"}],["AWS/Lambda","Throttles","FunctionName","praimana-bulk-provision",{"stat":"Sum","label":"bulk-provision"}],["AWS/Lambda","Throttles","FunctionName","praimana-cognito-presignup",{"stat":"Sum","label":"cognito-presignup"}],["AWS/Lambda","Throttles","FunctionName","praimana-cognito-postconfirmation",{"stat":"Sum","label":"cognito-postconfirmation"}]]}},{"type":"metric","x":16,"y":16,"width":8,"height":6,"properties":{"title":"Async: DLQ depth and projection lag","region":"us-east-1","period":300,"metrics":[["AWS/SQS","ApproximateNumberOfMessagesVisible","QueueName","${DlqName}",{"stat":"Maximum","label":"DLQ depth"}],["AWS/Lambda","IteratorAge","FunctionName","praimana-user-projection",{"stat":"Maximum","label":"stream lag (ms)","yAxis":"right"}]]}},{"type":"alarm","x":0,"y":22,"width":24,"height":5,"properties":{"title":"Alarms — domain invariants and platform health","alarms":["${A1}","${A2}","${A3}","${A4}","${A5}","${A6}","${A7}","${A8}","${A9}","${A10}","${A11}","${A12}"]}},{"type":"text","x":0,"y":27,"width":24,"height":2,"properties":{"markdown":"## Is it fast, and what is it growing?\nDuration is p99 — **an average hides the tail a participant experiences**. Functions time out at 15s, so a p99 approaching that means hard cuts mid-request. Log volume is the cost line that grew unbounded before retention was set."}},{"type":"metric","x":0,"y":29,"width":12,"height":6,"properties":{"title":"Duration p99 by service (ms)","region":"us-east-1","period":300,"metrics":[["AWS/Lambda","Duration","FunctionName","praimana-ai",{"stat":"p99","label":"ai"}],["AWS/Lambda","Duration","FunctionName","praimana-team",{"stat":"p99","label":"team"}],["AWS/Lambda","Duration","FunctionName","praimana-evaluation",{"stat":"p99","label":"evaluation"}],["AWS/Lambda","Duration","FunctionName","praimana-collaboration",{"stat":"p99","label":"collaboration"}],["AWS/Lambda","Duration","FunctionName","praimana-workshop",{"stat":"p99","label":"workshop"}],["AWS/Lambda","Duration","FunctionName","praimana-docs",{"stat":"p99","label":"docs"}],["AWS/Lambda","Duration","FunctionName","praimana-identity",{"stat":"p99","label":"identity"}],["AWS/Lambda","Duration","FunctionName","praimana-source",{"stat":"p99","label":"source"}],["AWS/Lambda","Duration","FunctionName","praimana-desktop",{"stat":"p99","label":"desktop"}],["AWS/Lambda","Duration","FunctionName","praimana-notify",{"stat":"p99","label":"notify"}],["AWS/Lambda","Duration","FunctionName","praimana-user-access",{"stat":"p99","label":"user-access"}],["AWS/Lambda","Duration","FunctionName","praimana-user-projection",{"stat":"p99","label":"user-projection"}],["AWS/Lambda","Duration","FunctionName","praimana-bulk-provision",{"stat":"p99","label":"bulk-provision"}],["AWS/Lambda","Duration","FunctionName","praimana-cognito-presignup",{"stat":"p99","label":"cognito-presignup"}],["AWS/Lambda","Duration","FunctionName","praimana-cognito-postconfirmation",{"stat":"p99","label":"cognito-postconfirmation"}]],"annotations":{"horizontal":[{"label":"timeout 15s","value":15000},{"label":"p99.9 budget 5s","value":5000}]}}},{"type":"metric","x":12,"y":29,"width":6,"height":6,"properties":{"title":"Invocations by service","region":"us-east-1","period":300,"metrics":[["AWS/Lambda","Invocations","FunctionName","praimana-ai",{"stat":"Sum","label":"ai"}],["AWS/Lambda","Invocations","FunctionName","praimana-team",{"stat":"Sum","label":"team"}],["AWS/Lambda","Invocations","FunctionName","praimana-evaluation",{"stat":"Sum","label":"evaluation"}],["AWS/Lambda","Invocations","FunctionName","praimana-collaboration",{"stat":"Sum","label":"collaboration"}],["AWS/Lambda","Invocations","FunctionName","praimana-workshop",{"stat":"Sum","label":"workshop"}],["AWS/Lambda","Invocations","FunctionName","praimana-docs",{"stat":"Sum","label":"docs"}],["AWS/Lambda","Invocations","FunctionName","praimana-identity",{"stat":"Sum","label":"identity"}],["AWS/Lambda","Invocations","FunctionName","praimana-source",{"stat":"Sum","label":"source"}],["AWS/Lambda","Invocations","FunctionName","praimana-desktop",{"stat":"Sum","label":"desktop"}],["AWS/Lambda","Invocations","FunctionName","praimana-notify",{"stat":"Sum","label":"notify"}],["AWS/Lambda","Invocations","FunctionName","praimana-user-access",{"stat":"Sum","label":"user-access"}],["AWS/Lambda","Invocations","FunctionName","praimana-user-projection",{"stat":"Sum","label":"user-projection"}],["AWS/Lambda","Invocations","FunctionName","praimana-bulk-provision",{"stat":"Sum","label":"bulk-provision"}],["AWS/Lambda","Invocations","FunctionName","praimana-cognito-presignup",{"stat":"Sum","label":"cognito-presignup"}],["AWS/Lambda","Invocations","FunctionName","praimana-cognito-postconfirmation",{"stat":"Sum","label":"cognito-postconfirmation"}]]}},{"type":"metric","x":18,"y":29,"width":6,"height":6,"properties":{"title":"Log bytes ingested","region":"us-east-1","stat":"Sum","period":86400,"metrics":[["AWS/Logs","IncomingBytes",{"label":"all groups"}]]}},{"type":"log","x":0,"y":35,"width":24,"height":6,"properties":{"title":"Refusals by EXPERIENCE — which workshop is affected right now","region":"us-east-1","query":"SOURCE '/praimana/ai' | SOURCE '/praimana/collaboration' | SOURCE '/praimana/desktop' | SOURCE '/praimana/docs' | SOURCE '/praimana/evaluation' | SOURCE '/praimana/identity' | SOURCE '/praimana/source' | SOURCE '/praimana/team' | SOURCE '/praimana/user-access' | SOURCE '/praimana/workshop' | filter ispresent(FailClosedRefusals) and ispresent(workshopId) | stats sum(FailClosedRefusals) as refusals by workshopId, Code, Service | sort refusals desc | limit 20","view":"table"}}]}
+        - ApiId: !Ref ApiId
+          DlqName: !Ref DeadLetterQueueName
+          A1: !GetAtt ApiServerErrorAlarm.Arn
+          A2: !GetAtt ApiLatencyAlarm.Arn
+          A3: !GetAtt LambdaThrottleAlarm.Arn
+          A4: !GetAtt LambdaErrorAlarm.Arn
+          A5: !GetAtt CognitoGroupAssignmentFailureAlarm.Arn
+          A6: !GetAtt SeatLedgerDriftAlarm.Arn
+          A7: !GetAtt UnauditedAccessChangeAlarm.Arn
+          A8: !GetAtt UserProjectionStreamLagAlarm.Arn
+          A9: !GetAtt DeadLetterQueueNotEmptyAlarm.Arn
+          A10: !GetAtt FailClosedRefusalAlarm.Arn
+          A11: !If
+            - CanaryEnabled
+            - !GetAtt CanaryFailureAlarm.Arn
+            - !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:praimana-canary-failed"
+          A12: !GetAtt BedrockRefusalAlarm.Arn
+
+  FailClosedRefusalAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-fail-closed-refusals
+      AlarmDescription: >-
+        Services are REFUSING requests because a dependency did not answer —
+        TEAM_SCOPE_UNAVAILABLE, ENTITLEMENTS_UNAVAILABLE and the rest. THIS IS THE OUTAGE NO OTHER
+        ALARM SEES: those are SUCCESSFUL invocations returning a 503 body, so Lambda Errors stays
+        FLAT while every user is refused (measured: 0 errors over 7 days). THE THRESHOLD IS
+        PROVISIONAL — nothing measured this before, so there is no baseline; retune after a week of
+        real data. RUNBOOK: (1) Split the metric by Code (why) and Service (who refused — the CALLER,
+        not necessarily the broken thing). (2) TEAM_SCOPE_* or ENTITLEMENTS_* means the Team service
+        is not answering; check its errors and duration. (3) SNAPSHOT_SOURCE_* means docs or
+        workshop. (4) UNCODED means a 503 with no code in the body — find it via the routePath
+        property. (5) THE REFUSAL IS CORRECT BEHAVIOUR; the bug is always the thing that
+        stopped answering.
+      Namespace: Praimana/FailClosed
+      MetricName: FailClosedRefusals
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  BedrockRefusalAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-bedrock-refused
+      AlarmDescription: >-
+        INSIGHTS GENERATION CANNOT REACH A MODEL. AWS/Bedrock does not show entitlement-layer
+        refusals, so this custom metric does. SPLIT BY `Reason`: (1) USE_CASE_NOT_SUBMITTED - a human
+        must submit the Anthropic use-case form; no deploy fixes it. (2) SUBSCRIPTION_INCOMPLETE - the
+        model is listed but not subscribed. (3) CONFIG_MISSING - BEDROCK_RATINGS_MODEL_ID or the
+        BEDROCK_GUARDRAIL_ID/VERSION pair is unset on the ai function. (4) MODEL_END_OF_LIFE /
+        MODEL_NOT_FOUND - repoint RatingsModelId. (5) ACCESS_DENIED - the ai function's IAM. (6)
+        RESPONSE_INVALID - the model answered unusably. (7) THROTTLED / SERVER_ERROR / TIMEOUT -
+        transient. (8) GUARDRAIL_INTERVENED - the Amazon Bedrock guardrail blocked a team's input or
+        the reply; a sustained rate means review that transcript or the filter strengths. The route
+        answers 503 (502 for an unusable reply) and keeps the previous snapshot.
+      Namespace: Praimana/Bedrock
+      MetricName: BedrockRefusals
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  CognitoGroupAssignmentFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-cognito-group-assignment-failed
+      AlarmDescription: >-
+        The Cognito post-confirmation trigger failed to add a confirmed user to
+        their role group. The user IS signed up but has no cognito:groups claim, so
+        they are treated as PARTICIPANT regardless of their invited role. Check the
+        praimana-cognito-postconfirmation logs for "add-to-group failed"; the
+        known cause is the AdminAddUserToGroup call being unable to reach
+        cognito-idp (a VPC endpoint is incompatible with a pool that has a domain).
+      Namespace: Praimana/CognitoPostConfirmation
+      MetricName: GroupAssignmentFailures
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  SeatLedgerDriftAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-seat-ledger-drift
+      AlarmDescription: >-
+        A team's memberCount no longer matches its ACTIVE roster. The count moves in the same
+        transaction as the membership row, so this CANNOT happen through the Team service —
+        it means a writer bypassed the membership repository. Consequence: joins are refused
+        to a team that has room (or allowed past its cap). RUNBOOK: (1) Find the team via the
+        log line "SEAT LEDGER DRIFT" — it carries teamId, actualActive and ledgerCount. (2)
+        THIS IS A CODE DEFECT, NOT A NUMBER TO RECONCILE. Grep for writes to team-members
+        outside repository.dynamo.ts admit/deactivate/reactivate; a new route or a script is
+        the usual cause. (3) Only after the writer is found, correct the row with a single
+        conditional UpdateItem — re-running the backfill will NOT fix it, its
+        attribute_not_exists guard skips rows that already have a count. (4) A separate log
+        line "no memberCount" means the OPPOSITE problem: an unledgered row, fixed by
+        scripts/backfill-team-seat-ledger.mjs, and it reports drift 0 by design.
+      Namespace: Praimana/TeamSeats
+      MetricName: SeatLedgerDrift
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  UnauditedAccessChangeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-unaudited-access-change
+      AlarmDescription: >-
+        An access change TOOK EFFECT but was NOT written to the audit trail: no record of
+        who made it. The change is real and the request answered 200 by design — this is a
+        lost audit fact, not a failed operation. RUNBOOK: (1) CHECK praimana-audit
+        FIRST — separate table, own capacity, so its WriteThrottleEvents /
+        ThrottledRequests / SystemErrors is the likely cause. (2) Find what was lost via the
+        Action dimension and the log line "access change UNRECORDED" (ids only). (3) THE
+        ACTOR IS RECOVERABLE FROM THE ROW for every action, written with the change and
+        BEFORE the audit call: MEMBER_* -> praimana-team-members
+        removedBy/reactivatedBy; ACCESS_* -> praimana-users accessChangedBy;
+        ENTITLEMENT_REVOKED -> praimana-invitations workshopRevokedBy. Only the MOST
+        RECENT actor is kept, so act before a later change overwrites it and CloudTrail is
+        all that is left. (4) The trail is append-only, so any reconstructed entry is a NEW
+        one and cannot be back-dated.
+      Namespace: Praimana/AccessChanges
+      MetricName: UnauditedAccessChanges
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  UserProjectionStreamLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-user-projection-stream-lag
+      AlarmDescription: >-
+        The users read-model projection is falling behind the praimana-users
+        DynamoDB Stream: member names, chat and commit authors, shared-thread bylines and
+        contribution rows are serving STALE data and will not self-correct while this is
+        breaching. RUNBOOK: (1) check the praimana-user-projection logs for
+        "read-model write failed" — a throttled or missing read-model table is the likely
+        cause, and the table name is in the log line; (2) check
+        praimana-dlq for records that exhausted MaximumRetryAttempts; (3) if the
+        shard is stalled on a poison record, the DLQ entry names its sequence number.
+        Do NOT raise ParallelizationFactor to catch up — the projection is
+        last-write-wins and depends on single-threaded per-shard ordering; concurrent
+        invocations would write the wrong name permanently. Once the cause is fixed, run
+        scripts/backfill-user-readmodels.mjs to converge anything that aged out of the
+        stream's 24h retention.
+      Namespace: AWS/Lambda
+      MetricName: IteratorAge
+      Dimensions:
+        - Name: FunctionName
+          Value: praimana-user-projection
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  DeadLetterQueueNotEmptyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      AlarmName: praimana-dlq-not-empty
+      AlarmDescription: >-
+        A message reached praimana-dlq, meaning some event exhausted its retries and
+        is now dropped unless someone acts. RUNBOOK: (1) receive (do not delete) the
+        messages to identify the source — the user-projection stream mapping sends record
+        METADATA including the shard and sequence number, the EventBridge rule sends the
+        original event; (2) for a projection failure, fix the underlying read-model write
+        (see the praimana-user-projection-stream-lag runbook) and then run
+        scripts/backfill-user-readmodels.mjs, which is idempotent and reconverges every
+        user regardless of which record was lost; (3) purge only after the data is
+        confirmed converged, because purging is the point at which the loss becomes
+        permanent and unattributable.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: praimana-dlq
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+Outputs:
+  AlertsTopicArn:
+    Description: >
+      Subscribe a chat channel or ticket queue here if email is the wrong destination. The topic
+      exists even when AlertEmail is empty, so this is always valid.
+    Value: !Ref AlertsTopic
+
+  DashboardName:
+    Description: The platform dashboard. Three rows - is it up, is it healthy, is it fast.
+    Value: !Ref PlatformDashboard
+
+  CanaryName:
+    Condition: CanaryEnabled
+    Description: Liveness canary. Probes from outside, so it notices what in-stack metrics cannot.
+    Value: !Ref HealthCanary

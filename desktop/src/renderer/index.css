@@ -1,0 +1,158 @@
+/* ⚠ NO `@xterm/xterm/css/xterm.css` IMPORT. The embedded terminal was removed — see the note where the
+   `pty:*` bridges used to be in src/preload/index.ts. It was the only thing that needed these styles. */
+
+/*
+ * ── ⚠ THE PALETTE LIVES HERE, IN TWO MODES, AND THIS FILE IS THE SOURCE OF TRUTH ───────────
+ *
+ * Every colour token is a CSS CUSTOM PROPERTY, and `tailwind.config.ts` maps each token name to the
+ * variable rather than to a hex. That is what makes two themes possible without touching the ~930
+ * `surface-*` / `brand-*` class usages in the app: a component keeps writing `bg-surface-panel`, and the
+ * VALUE behind it changes with the mode.
+ *
+ * ⚠ THE VALUES ARE "R G B" CHANNELS, NOT HEX, AND THAT IS NOT A STYLE CHOICE. The app uses opacity
+ * modifiers on these tokens — `brand-accent/40`, `surface-panel/60`, `tool-ok/15`, `tool-warning/40`.
+ * Tailwind implements those by substituting into `rgb(var(--x) / <alpha-value>)`, which requires bare
+ * channels. A hex in the variable makes every one of those seven usages silently produce no colour.
+ *
+ * ⚠ DARK IS `:root`, SO IT IS THE FALLBACK. If the theme attribute is ever missing, absent or misspelled,
+ * the app renders dark — the mode it has always shipped — rather than unstyled.
+ *
+ * ── EVERY PAIRING IS MEASURED IN BOTH MODES ──
+ *
+ * 31 role-based pairings per mode (ink on each surface, indicators, filled buttons, bubble separation)
+ * are computed from these values by `view-theme.test.ts`. The light palette was authored against that
+ * matrix rather than by eye, and three values moved because of it:
+ *
+ *   panel   #f9fafb → #f3f4f6   gray-50 measured 1.05:1 against white — pane headers and cards were
+ *                               invisible on the page. gray-100 gives 1.10:1.
+ *   faint   #6b7280 → #636e7d   gray-500 measured 4.39:1 on the light panel, under the 4.5:1 floor for
+ *                               the 11px timestamps that use it.
+ *   kiro    #dbeafe → #bfdbfe   blue-100 was 1.11:1 against the light panel, so a participant's own
+ *   bubble                      message box was indistinguishable from the assistant's.
+ *
+ * ⚠ ONE PAIRING IS FORBIDDEN RATHER THAN FIXED: `surface-muted` on `surface-raised` measures 4.06:1 in
+ * DARK mode. It is documented in the components that avoid it, and the suite asserts it stays unused
+ * rather than pretending the palette is safe everywhere.
+ */
+:root {
+  --surface-bg: 17 24 39;        /* #111827 */
+  --surface-panel: 31 41 55;     /* #1f2937 */
+  --surface-raised: 55 65 81;    /* #374151 */
+  --surface-line: 55 65 81;      /* #374151 */
+  --surface-edge: 107 114 128;   /* #6b7280 */
+  --surface-text: 229 231 235;   /* #e5e7eb */
+  --surface-muted: 156 163 175;  /* #9ca3af */
+  --surface-faint: 139 147 161;  /* #8b93a1 */
+  --brand-accent: 147 197 253;   /* #93c5fd */
+  --brand-strong: 37 99 235;     /* #2563eb */
+  --brand-dark: 29 78 216;       /* #1d4ed8 */
+  --claude-accent: 217 119 87;   /* #d97757 */
+  --claude-strong: 168 67 44;    /* #a8432c */
+  --kiro-accent: 147 197 253;    /* #93c5fd */
+  --kiro-strong: 37 99 235;      /* #2563eb */
+  --kiro-bubble: 34 67 107;      /* #22436b */
+  --codex-accent: 209 213 219;   /* #d1d5db */
+  --tool-ok: 116 201 145;        /* #74c991 */
+  --tool-error: 199 78 57;       /* #c74e39 */
+  --tool-warning: 225 192 141;   /* #e1c08d */
+  --tool-error-text: 244 135 113; /* #f48771 */
+}
+
+/*
+ * ⚠ LIGHT IS AN ATTRIBUTE ON <html>, SET BY THE RENDERER — see `lib/theme.ts`. It is NOT
+ * `@media (prefers-color-scheme)`: the mode is a SETTING with three values, and Auto is only one of
+ * them. A media query would override an explicit choice, so the OS preference is read in the main
+ * process and resolved to an attribute here.
+ */
+[data-theme="light"] {
+  --surface-bg: 255 255 255;     /* #ffffff */
+  --surface-panel: 243 244 246;  /* #f3f4f6 */
+  --surface-raised: 229 231 235; /* #e5e7eb */
+  --surface-line: 209 213 219;   /* #d1d5db */
+  --surface-edge: 107 114 128;   /* #6b7280 */
+  --surface-text: 17 24 39;      /* #111827 */
+  --surface-muted: 75 85 99;     /* #4b5563 */
+  --surface-faint: 99 110 125;   /* #636e7d */
+  --brand-accent: 29 78 216;     /* #1d4ed8 */
+  --brand-strong: 37 99 235;     /* #2563eb */
+  --brand-dark: 30 64 175;       /* #1e40af */
+  --claude-accent: 168 67 44;    /* #a8432c */
+  --claude-strong: 143 56 35;    /* #8f3823 */
+  --kiro-accent: 29 78 216;      /* #1d4ed8 */
+  --kiro-strong: 37 99 235;      /* #2563eb */
+  --kiro-bubble: 191 219 254;    /* #bfdbfe */
+  --codex-accent: 55 65 81;      /* #374151 */
+  --tool-ok: 21 128 61;          /* #15803d */
+  --tool-error: 185 28 28;       /* #b91c1c */
+  --tool-warning: 180 83 9;      /* #b45309 */
+  --tool-error-text: 185 28 28;  /* #b91c1c */
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/**
+ * ── ⚠ THE DOCUMENT ITSELF DOES NOT SCROLL ────────────────────────────────────────────────
+ *
+ * This is an app shell, not a document: the root is `h-screen` and every view scrolls INSIDE itself
+ * (`overflow-y-auto` over `flex: 1 1 0; min-height: 0`). Nothing here has `height`/`overflow` set,
+ * though, so anything that momentarily exceeds 100vh — a grown textarea, an open dropdown, a view
+ * missing its inner scroll — scrolls the WHOLE page instead, giving two scrollbars for one list.
+ *
+ * ⚠ SAFE ONLY BECAUSE EVERY FULL-SCREEN VIEW OWNS AN INNER SCROLL, which was checked rather than
+ * assumed: Settings, PlatformSetup, JoinTeam, SignIn and AccountPanel all carry `overflow-y-auto`.
+ * `SelectAssistantView` did NOT and has been given one in the same change — without that, this rule
+ * would make its lower half unreachable on a short window, which is worse than a stray scrollbar.
+ */
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+  /**
+   * ⚠ THE DEFAULT TEXT COLOUR, AND THE REASON THIS LINE EXISTS.
+   *
+   * The views were re-themed token by token, and that pass could only fix text that HAD a colour class. Any
+   * element without one inherits from here — and with no `color` set, that was the browser default: BLACK, on
+   * a near-black surface. Effectively invisible, and invisible to a token audit too, because there is no class
+   * to find. Five such elements existed in Phases and Board (headings, buttons, inputs); each is now explicit,
+   * and this is the backstop for the next one somebody forgets.
+   *
+   * `surface.text` (#e5e7eb) — 14.33:1 on `surface.bg`, so an element that inherits is legible by default
+   * rather than by luck. Setting it on `body` rather than on each view also means a new component starts
+   * correct instead of starting black.
+   */
+  color: #e5e7eb;
+
+  /**
+   * And the page's own background, for the same reason: an area no view covers — during a route change, or
+   * behind a short view — showed white. Matches `surface.bg`.
+   */
+  background-color: #111827;
+}
+
+/* Toast entrance (see components/Toast.tsx) */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+/*
+ * ⚠ THE `.xterm` OVERRIDES ARE GONE TOO, AND THEY OUTLIVED THEIR IMPORT BY A BUILD. Removing the
+ * `@import "@xterm/xterm/css/xterm.css"` at the top of this file left these three rules behind — sizing
+ * for `.xterm`, a text cursor on `.xterm-screen`, and thirteen `!important` declarations parking
+ * xterm's hidden helper textarea off-screen. Nothing in the app can match them now that
+ * `TerminalView.tsx` is deleted, so they were dead selectors shipped in every bundle.
+ *
+ * ⚠ CAUGHT BY GREPPING THE BUILT CSS, not the source. The import was gone and `@xterm/*` was out of
+ * package.json, yet `dist/renderer/assets/*.css` still contained `xterm-helper-textarea` — because
+ * these rules are hand-written here rather than pulled in by the dependency. Deleting a dependency is
+ * not the same as deleting the styles that were written to correct it.
+ */

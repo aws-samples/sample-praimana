@@ -1,0 +1,210 @@
+# Build the Windows installers and publish them to the `artifacts` bucket.
+#
+# ⚠ THIS RUNS ON WINDOWS, SO THE SHELL IS POWERSHELL, NOT BASH. Every construct here is
+# PowerShell; bash idioms (`[ -n "$x" ]`, `$(...)`, `||`) silently mean something else or
+# nothing. The other two desktop buildspecs are bash - do not copy lines between them.
+#
+# Driven by a CodeBuild project, which runs it on
+# WINDOWS_SERVER_2019_CONTAINER. That environment type works on ON-DEMAND compute, so no
+# reserved fleet is needed for Windows (unlike macOS, and unlike WINDOWS_SERVER_2022 which
+# requires a fleet). The Server Core 2019 base image exists only in us-east-1, us-east-2,
+# us-west-2 and eu-west-1.
+#
+# Env vars supplied by the project:
+#   ARTIFACTS_BUCKET  - destination bucket
+#   ARTIFACTS_PREFIX  - key prefix, e.g. "desktop/"
+#
+# KEY LAYOUT is fixed by the backend, not chosen here. services/desktop/src/s3.store.ts
+# lists <prefix>windows/ and picks the NEWEST BY LastModified, then presigns it. So:
+#   * the file lands under desktop/windows/
+#   * publishing supersedes the previous build purely by being newer
+#   * the key's last segment becomes the browser's download filename
+#
+# ── ⚠ THIS PRODUCES UNSIGNED INSTALLERS ────────────────────────────────────────────────────
+#
+# This sample ships WITHOUT Authenticode code signing. Windows SmartScreen will show
+# "Windows protected your PC" and the user must choose More info -> Run anyway. That is a
+# warning, not a block (unlike macOS Gatekeeper, which refuses an unsigned app outright).
+#
+# TO SIGN WITH YOUR OWN AUTHENTICODE CERTIFICATE, use electron-builder's built-in Windows
+# signing — no changes to this buildspec's structure are required. An NSIS target produces
+# several signable PE files (the app .exe, the installer and the uninstaller); electron-builder
+# signs all of them in one pass. In short, provide your certificate to electron-builder via its
+# `win.signtoolOptions` configuration (for example `certificateFile` + `certificatePassword`,
+# or `certificateSubjectName` for a cert already in the Windows store) and it will invoke
+# signtool for each binary. See the electron-builder "Code Signing" documentation for the
+# current options. package.json pins `win.signtoolOptions.signingHashAlgorithms` to ["sha256"]
+# so a signed build makes one signtool pass per file rather than defaulting to the legacy
+# ["sha1","sha256"] pair.
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - |
+        $ver = "v22.23.2"
+        $sha256 = "1177b4137ba5adaa56354ae40f1080c7450e8ae09cecb47da459d1c52ac99f97"
+        $dest = "C:\node22"
+        if (-not (Test-Path "$dest\node.exe")) {
+          $zip = "$env:TEMP\node.zip"
+          Invoke-WebRequest -Uri "https://nodejs.org/dist/$ver/node-$ver-win-x64.zip" -OutFile $zip
+          # Get-FileHash returns uppercase; the pin is lowercase, so normalise before comparing.
+          $actual = (Get-FileHash -Algorithm SHA256 -Path $zip).Hash.ToLower()
+          if ($actual -ne $sha256) {
+            Write-Host "FATAL: node-$ver-win-x64.zip does not match its pinned checksum."
+            Write-Host "  expected $sha256"
+            Write-Host "  actual   $actual"
+            Write-Host "If you just changed the version pin, update `$sha256 from https://nodejs.org/dist/$ver/SHASUMS256.txt"
+            Write-Host "Otherwise this archive is not the one this build was written for - do NOT extract it."
+            # Removed rather than left on the host: nothing else should be able to find it.
+            Remove-Item $zip -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "node $ver archive matches its pinned sha256"
+          Expand-Archive -Path $zip -DestinationPath "C:\" -Force
+          Move-Item "C:\node-$ver-win-x64" $dest -Force
+        }
+        if (-not (Test-Path "$dest\node.exe")) {
+          Write-Host "FATAL: Node $ver did not install to $dest"
+          exit 1
+        }
+        & "$dest\node.exe" --version
+      # PATH must be re-established in every later block: CodeBuild runs each command in its
+      # own shell, so an assignment here does not survive to the next entry.
+      - |
+        $env:PATH = "C:\node22;$env:PATH"
+        # Fail loudly rather than segfault later. This is the check that would have turned a
+        # confusing exit 139 into one line naming the cause.
+        $major = [int]((node -p "process.versions.node").Split(".")[0])
+        Write-Host "node $(node --version) (major $major)"
+        if ($major -lt 22) {
+          Write-Host "FATAL: better-sqlite3 13 requires Node >= 22; this runtime is $major."
+          exit 1
+        }
+        corepack enable
+        $pm = (node -p "require('./package.json').packageManager")
+        corepack prepare $pm --activate
+        pnpm --version
+
+  pre_build:
+    commands:
+      - |
+        $version = (node -p "require('./package.json').version")
+        if (-not $version) { Write-Error "no version in package.json"; exit 1 }
+        $commit = if ($env:CODEBUILD_RESOLVED_SOURCE_VERSION) { $env:CODEBUILD_RESOLVED_SOURCE_VERSION } else { "unknown" }
+        $short = $commit.Substring(0, [Math]::Min(12, $commit.Length))
+        Write-Host "version=$version commit=$short"
+        # Passed between phases via a file: each CodeBuild command runs in its own shell, so
+        # a variable set here is gone by the next entry.
+        "$version|$commit|$short" | Out-File -Encoding ascii -NoNewline "$env:TEMP\build.txt"
+
+  build:
+    commands:
+      - |
+        $env:PATH = "C:\node22;$env:PATH"
+        pnpm install --frozen-lockfile
+      # Verifies better-sqlite3 loads under BOTH system Node and Electron. It no longer
+      # rebuilds anything (better-sqlite3 13 is a Node-API addon shipped via prebuildify, so
+      # one binary serves every runtime) but it is the only check that would catch a future
+      # dependency bump silently reverting to a per-ABI addon - the Vitest suite cannot,
+      # because it mocks better-sqlite3 and passes either way.
+      - |
+        $env:PATH = "C:\node22;$env:PATH"
+        pnpm run rebuild-native
+      - |
+        $env:PATH = "C:\node22;$env:PATH"
+        pnpm run build
+      # --publish never: electron-builder must not try to upload anywhere itself. There is
+      # no publish provider configured and auto-update was deliberately removed from this
+      # app; publication is this buildspec's job.
+      # Targets and arches (nsis x64 + arm64) come from package.json build.win.
+      #
+      # This sample builds UNSIGNED installers. To sign with your own Authenticode certificate,
+      # supply it through electron-builder's `win.signtoolOptions` configuration (see the header)
+      # — the build invocation below does not change.
+      - |
+        $env:PATH = "C:\node22;$env:PATH"
+        Write-Host "=============================================================="
+        Write-Host "NO AUTHENTICODE SIGNING - building UNSIGNED installers."
+        Write-Host "SmartScreen will show 'Windows protected your PC' and the user"
+        Write-Host "must choose More info -> Run anyway. A warning, not a block."
+        Write-Host "=============================================================="
+        npx electron-builder --windows --publish never
+
+  post_build:
+    commands:
+      # CodeBuild runs post_build even after a failed phase. Without this, a failed
+      # electron-builder would still publish whatever happened to be in release/.
+      - |
+        if ($env:CODEBUILD_BUILD_SUCCEEDING -ne "1") {
+          Write-Host "REFUSING TO PUBLISH: an earlier phase failed. Nothing uploaded."
+          exit 1
+        }
+
+      - |
+        $parts = (Get-Content "$env:TEMP\build.txt" -Raw) -split '\|'
+        $version = $parts[0]; $commit = $parts[1]; $short = $parts[2]
+
+        # Only the installers. release/ also holds unpacked app trees, blockmaps and
+        # builder-debug.yml, none of which a customer should be offered.
+        $installers = Get-ChildItem -Path release -Filter *.exe -File
+        if ($installers.Count -eq 0) {
+          Write-Host "FATAL: electron-builder produced no .exe in release/"
+          Get-ChildItem -Path release | ForEach-Object { Write-Host "  $($_.Name)" }
+          exit 1
+        }
+        Write-Host "installers built:"
+        $installers | ForEach-Object { Write-Host ("  {0}  {1:N1} MB" -f $_.Name, ($_.Length/1MB)) }
+
+        # Both arches expected, from package.json build.win.target.
+        $expected = @("x64","arm64")
+        foreach ($a in $expected) {
+          if (-not ($installers | Where-Object { $_.Name -like "*$a*" })) {
+            Write-Host "FATAL: no installer for arch $a - package.json build.win.target lists it"
+            exit 1
+          }
+        }
+
+        # -- An artifact digest, in the object's own metadata --------------------------------------
+        #
+        # SECURITY FINDING (Medium): release installers were published unsigned, un-notarized and with
+        # no checksum, and selected for download by recency. Publication
+        # verified only byte LENGTH, so a substituted object of the same size passed and there was
+        # no digest anywhere for a downloader to check an installer against.
+        #
+        # It goes in the METADATA rather than a sibling .sha256 object, and that is not a style
+        # preference - a sibling would BREAK THE DOWNLOAD BUTTON. services/desktop's latest() lists
+        # everything under desktop/<platform>/, filters only the folder placeholder, and picks the
+        # NEWEST BY LastModified, so a .sha256 uploaded after its installer becomes the newest
+        # object and the download endpoint would presign the checksum file. Metadata travels with
+        # the object and adds nothing to the listing.
+        #
+        # It detects a corrupted or truncated download and lets support confirm "the file you have
+        # is the file we published". It is NOT a substitute for Authenticode signing: an actor who
+        # can write the object can write its metadata. Signing is the control and it needs a
+        # certificate (see the header); this is the part that ships without one.
+        foreach ($f in $installers) {
+          $key = "$($env:ARTIFACTS_PREFIX)windows/$($f.Name)"
+          $sha = (Get-FileHash -Algorithm SHA256 -LiteralPath $f.FullName).Hash.ToLower()
+          if (-not $sha) { Write-Host "FATAL: could not compute sha256 for $($f.Name)"; exit 1 }
+          aws s3 cp $f.FullName "s3://$($env:ARTIFACTS_BUCKET)/$key" `
+            --metadata "version=$version,commit=$commit,build=$($env:CODEBUILD_BUILD_NUMBER),signed=false,sha256=$sha"
+          if ($LASTEXITCODE -ne 0) { Write-Host "FATAL: upload failed for $key"; exit 1 }
+
+          # Read back rather than trusting the copy - a truncated upload is otherwise
+          # invisible until a customer's download fails to run.
+          $remote = (aws s3api head-object --bucket $env:ARTIFACTS_BUCKET --key $key --query ContentLength --output text)
+          Write-Host "  $key  local=$($f.Length) remote=$remote"
+          if ([int64]$remote -ne $f.Length) { Write-Host "FATAL: size differs for $key"; exit 1 }
+
+          # Same reasoning as the size check: a digest silently dropped by the upload is worse than
+          # none at all, because it reads as verified.
+          $remoteSha = (aws s3api head-object --bucket $env:ARTIFACTS_BUCKET --key $key --query "Metadata.sha256" --output text)
+          Write-Host "  $key  sha256=$sha"
+          if ($remoteSha -ne $sha) {
+            Write-Host "FATAL: sha256 metadata missing or wrong for $key (remote=$remoteSha)"
+            exit 1
+          }
+        }
+        Write-Host "published and verified $($installers.Count) Windows installer(s)"
+        aws s3 ls "s3://$($env:ARTIFACTS_BUCKET)/$($env:ARTIFACTS_PREFIX)windows/"

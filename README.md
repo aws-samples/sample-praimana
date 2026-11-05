@@ -141,6 +141,16 @@ threat model.
 
 ---
 
+## Roadmap
+
+Planned features include @mentions and pinned messages in team chat, automatic teammate notification
+and live relay for shared AI chats, single sign-on for the portal and desktop, showing the model used
+in each AI chat, and AI response analysis across models and assistants. See
+[ROADMAP.md](ROADMAP.md) for details, and [RELEASE-NOTES.md](RELEASE-NOTES.md) for what shipped in
+each release.
+
+---
+
 ## Important Notes
 
 This is sample code, for non-production usage. You should work with your security and legal teams
@@ -162,4 +172,4 @@ to meet your organizational security, regulatory and compliance requirements bef
 
 ## License
 
-This library is licensed under the MIT-0 License. See the `LICENSE.md` file.
+This library is licensed under the MIT-0 License. See the [LICENSE](LICENSE) file.

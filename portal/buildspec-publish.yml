@@ -1,0 +1,291 @@
+# Package the portal SOURCE and publish a VERSIONED zip to the Shared-account portal bucket.
+#
+# This zip is BUILD INPUT, not build output: it carries the source tree that
+# PortalBuildProject (in platform-portal.yaml) then builds and deploys to PortalFunction. So
+# `next build` deliberately does NOT run here, and no NEXT_PUBLIC_* values are baked in - those
+# are supplied as CodeBuild environment variables on PortalBuildProject and written into
+# .env.production there.
+#
+# ⚠ THIS HEADER PREVIOUSLY SAID "AMPLIFY" and named an Amplify app with "its own
+# CloudFormation template". No such app or template exists: Amplify Hosting was replaced by
+# CodeBuild + Lambda behind CloudFront (see WHY NOT AMPLIFY at the top of platform-portal.yaml).
+# Worth knowing because the old wording would send you looking for a stack that was never there.
+#
+# Driven by a CodeBuild project in the CI/CD pipeline.
+# Env vars it supplies:
+#   PORTAL_BUCKET    - destination bucket name (in the SHARED account)
+#   PORTAL_PREFIX    - key prefix, must stay within what the bucket policy grants (portal/)
+#   RUN_CHECKS       - "true" (default) to gate on type-check + lint + test before publishing
+#
+# Publishes TWO keys per build - an immutable portal-<version>-<sha>.zip and a
+# portal-<version>.zip pointer at the latest build of that version. No manual version bump
+# is needed to publish, because the commit in the immutable key makes collisions impossible.
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+    commands:
+      # Only needed when RUN_CHECKS is on; a pure packaging run does not touch pnpm.
+      - |
+        if [ "${RUN_CHECKS:-true}" = "true" ]; then
+          corepack enable
+          corepack prepare "$(node -p "require('./package.json').packageManager")" --activate
+          pnpm --version
+        else
+          echo "RUN_CHECKS=false - skipping toolchain setup"
+        fi
+
+  pre_build:
+    commands:
+      # ---- version + keys ----------------------------------------------------------
+      # TWO KEYS PER BUILD, and the split is the reason no manual version bump is needed:
+      #
+      #   IMMUTABLE  portal/<version>/portal-<version>-<sha>.zip   one per commit, forever
+      #   POINTER    portal/<version>/portal-<version>.zip         "latest build of <version>"
+      #
+      # An earlier design used the pointer key alone. Two builds of one version therefore
+      # collided, so the buildspec refused to overwrite and told you to bump - which
+      # deadlocked the pipeline: a build that had already published 0.6.11 blocked every
+      # later run at this step, and only a version bump cleared it. Putting the commit in
+      # the key removes the collision structurally instead of guarding against it.
+      #
+      # The VERSION still comes from package.json and still means what a human meant by it:
+      # a build counter cannot know whether a change is breaking or a typo, so nothing here
+      # invents or increments a version. Rebuilding a commit reproduces its artifact rather
+      # than minting a new identity for the same source.
+      - |
+        VERSION="$(node -p "require('./package.json').version")"
+        [ -n "$VERSION" ] || { echo "FATAL: no version in package.json"; exit 1; }
+        COMMIT="${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}"
+        SHORT="${COMMIT:0:12}"
+        KEY="${PORTAL_PREFIX}${VERSION}/portal-${VERSION}-${SHORT}.zip"
+        POINTER="${PORTAL_PREFIX}${VERSION}/portal-${VERSION}.zip"
+        { echo "VERSION=$VERSION"; echo "COMMIT=$COMMIT"; echo "SHORT=$SHORT"
+          echo "KEY=$KEY"; echo "POINTER=$POINTER"; } > /tmp/build.env
+        echo "version=$VERSION commit=$SHORT"
+        echo "  immutable s3://$PORTAL_BUCKET/$KEY"
+        echo "  pointer   s3://$PORTAL_BUCKET/$POINTER"
+
+      # Informational only - nothing here can fail the build. A rebuild of the same commit
+      # is idempotent by design, and the pointer is meant to move.
+      #
+      # ⚠ THE POINTER CAN MOVE BACKWARDS. Re-running an OLD commit republishes it and the
+      # pointer then names that older tree as "latest <version>". The source artifact has no
+      # .git, so this cannot check ancestry - instead it prints the commit being replaced, so
+      # the log says plainly what happened. The immutable key is never affected, and bucket
+      # versioning keeps every prior pointer object.
+      - |
+        . /tmp/build.env
+        if aws s3api head-object --bucket "$PORTAL_BUCKET" --key "$KEY" >/dev/null 2>&1; then
+          echo "note: this commit was already published - republishing identically"
+        fi
+        prev=$(aws s3api head-object --bucket "$PORTAL_BUCKET" --key "$POINTER" \
+                 --query 'Metadata.commit' --output text 2>/dev/null || true)
+        if [ -n "$prev" ] && [ "$prev" != "None" ] && [ "$prev" != "$COMMIT" ]; then
+          echo "note: pointer currently names ${prev:0:12}; this build will move it to $SHORT"
+        fi
+
+  build:
+    commands:
+      # Gates. PortalBuildProject will build this zip; catching a type error or failing test
+      # HERE costs one CodeBuild minute, catching it there costs a failed deployment of a
+      # version number that is now burned. Playwright e2e is deliberately not run - it
+      # needs a live server, and belongs to a stage that has somewhere to point at.
+      - |
+        # ⚠⚠ `set -e` IS LOAD-BEARING, AND ITS ABSENCE MADE THE GATE BELOW DECORATION.
+        #
+        # Every command in this block runs in ONE shell. CodeBuild fails a build when a
+        # `commands:` ENTRY exits non-zero, and this whole block is a single entry - so without
+        # `set -e` the block's exit status is whatever the LAST line returned, and a failure in
+        # any earlier line is discarded.
+        #
+        # That is not hypothetical. `pnpm audit` once found 4 HIGH advisories here and
+        # returned 1; `pnpm run test` then passed, the block exited 0, and the pipeline published
+        # a release it should have blocked. The sibling gates in services/buildspec-publish.yml
+        # and desktop/buildspec-validate.yml caught the same advisories and failed correctly,
+        # because there each command is its own list entry.
+        #
+        # Do not remove this line, and do not add a command after the gates whose success could
+        # mask them.
+        set -e
+        if [ "${RUN_CHECKS:-true}" != "true" ]; then
+          echo "RUN_CHECKS=false - publishing WITHOUT type-check, lint or tests"
+          exit 0
+        fi
+        pnpm install --frozen-lockfile
+        # ─── SCA: DEPENDENCY VULNERABILITY GATE ─────────────────────────────────────────────
+        # ⚠ Without this gate nothing examines dependencies; the first-party code
+        # scanners (SAST) scan first-party code only. The first run found 11 known-vulnerable
+        # packages here, including TWO CRITICAL in `next` itself (GHSA-2xp9-vwfh-vxw4,
+        # GHSA-p293-qw3h-jr36), fixed in the 15.5.23 -> 15.5.24 patch, plus HIGH in sharp and
+        # postcss. This is the internet-facing surface, so it is the one that mattered most.
+        #
+        # ⚠ SCOPED TO PRODUCTION DEPENDENCIES (--prod). The gate blocks on vulnerabilities in
+        # what is actually SHIPPED in the deployed artifact, not in build-only tooling. The
+        # motivating case: `braces` (GHSA-vfj7-8cjw-p6xm, a stack-exhaustion DoS, range <=3.0.3)
+        # has NO patched version published anywhere - braces latest is 3.0.3 - and it reaches
+        # this repo only transitively through dev/build tooling (chokidar, micromatch). A build
+        # tool DoS that never runs in production should not be able to block a release with no
+        # remedy available. Prod-scoping clears it legitimately while still failing on anything
+        # that ships (source-map-js and sharp were both fixed by override to a patched version).
+        #
+        # Fails on HIGH or CRITICAL in production dependencies.
+        #
+        # ⚠ IT SITS INSIDE THE RUN_CHECKS BLOCK, which means RUN_CHECKS=false skips the
+        # vulnerability gate along with type-check, lint and tests. That is a deliberate
+        # consequence of where the existing escape hatch already was, not an oversight -
+        # but it does mean RUN_CHECKS=false publishes with NO dependency scanning at all.
+        # Treat that flag as "I am publishing something unverified", because it is.
+        #
+        # ⚠ DO NOT append `|| true`. A gate that cannot fail is not a gate. --prod narrows the
+        # SCOPE to shipped deps; it does not neuter the gate - a shipped high/critical still fails.
+        pnpm audit --audit-level=high --prod
+        pnpm run type-check
+        pnpm run lint
+        pnpm run test
+
+  post_build:
+    commands:
+      # ⚠ THE GATE ONLY GATES BECAUSE OF THIS CHECK. CodeBuild runs post_build EVEN WHEN A
+      # PREVIOUS PHASE FAILED - that is the documented behaviour, so cleanup steps still get
+      # a chance to run. Without this guard, a failing type-check, lint or test suite in the
+      # build phase does not stop publication: a build can report
+      # BUILD=FAILED and POST_BUILD=SUCCEEDED, and push a bundle to S3 anyway while
+      # CodePipeline showed the stage red. A red pipeline beside a published artifact is
+      # worse than either alone, because the artifact looks legitimate.
+      #
+      # CODEBUILD_BUILD_SUCCEEDING is 0 once any phase has failed. Failing here stops the
+      # rest of post_build: commands run in order and a non-zero exit ends the phase.
+      - |
+        if [ "${CODEBUILD_BUILD_SUCCEEDING:-1}" != "1" ]; then
+          echo "=============================================================="
+          echo "REFUSING TO PUBLISH: an earlier phase failed."
+          echo "Nothing is uploaded. Fix the failure above and re-run."
+          echo "=============================================================="
+          exit 1
+        fi
+        echo "all previous phases succeeded - proceeding to package and publish"
+
+      # ---- assemble the source bundle ----------------------------------------------
+      # THE WHOLE REPO, minus the exclusions below. An allowlist was the wrong shape here:
+      # it silently drops any file a future commit adds (a new config, a generated route
+      # manifest), and the failure surfaces as a broken downstream build rather than a
+      # missing file.
+      #
+      # ⚠ THE CONSUMER IS PortalBuildProject, NOT AMPLIFY. This rationale used to name Amplify
+      # throughout; Amplify Hosting was replaced by CodeBuild + Lambda (see WHY NOT AMPLIFY at
+      # the top of platform-portal.yaml) and amplify.yml was deleted. The exclusions
+      # below did not change - each one holds for the same reason against the new consumer -
+      # but the stated reason did.
+      #
+      # EXCLUSIONS, and why each is not a preference:
+      #   .git          - large and useless to a build.
+      #   .next         - stale build output; the build produces its own.
+      #   node_modules  - MANDATORY. When RUN_CHECKS=true this step runs AFTER
+      #                   `pnpm install`, so node_modules exists in the source dir. Zipping
+      #                   it would add hundreds of MB and ship a hoisted tree of natively
+      #                   compiled binaries (sharp) built for THIS image, which the build
+      #                   image would then either trip over or silently prefer to its own
+      #                   install.
+      #   .turbo, *.tsbuildinfo - incremental-build scratch, same class as .next.
+      #
+      # Everything else travels, including .npmrc (pins the public registry and sets
+      # node-linker=hoisted - without it the install fails or packages a symlink tree with no
+      # dependencies) and pnpm-workspace.yaml (onlyBuiltDependencies for sharp).
+      - |
+        . /tmp/build.env
+        rm -rf /tmp/bundle && mkdir -p /tmp/bundle
+        tar -cf - \
+          --exclude='./.git' --exclude='./.next' --exclude='./node_modules' \
+          --exclude='./.turbo' --exclude='*.tsbuildinfo' \
+          . | tar -xf - -C /tmp/bundle
+        echo "bundle top level:"; ls -a /tmp/bundle | grep -vE '^\.$|^\.\.$' | sed 's/^/  /'
+        echo "  files: $(find /tmp/bundle -type f | wc -l)  size: $(du -sh /tmp/bundle | cut -f1)"
+
+      # ⚠ SECRET LEAK GUARD - KEPT DELIBERATELY, even though the bundle is otherwise
+      # "the whole repo". The portal bucket grants cross-account READ to the app account, so
+      # everything in this zip is readable by another account. A .env carrying
+      # NEXTAUTH_SECRET or COGNITO_CLIENT_SECRET would be a credential leak, not an
+      # untidiness.
+      #
+      # In normal operation this never fires: .gitignore covers .env and .env.*, so a
+      # CodePipeline source artifact (which is the git tree) cannot contain them. It exists
+      # for the two cases where that stops being true - someone runs this buildspec against
+      # a working tree, or a future commit un-ignores an env file. Failing the build is the
+      # correct outcome in both; publishing secrets to a cross-account-readable bucket is
+      # not recoverable by deleting the object afterwards.
+      - |
+        found=$(find /tmp/bundle -name '.env' -o -name '.env.*' ! -name '.env.example' 2>/dev/null)
+        if [ -n "$found" ]; then
+          echo "FATAL: environment files present in the bundle:"; echo "$found" | sed 's/^/  /'
+          echo "       This bucket is readable by another account. Refusing to publish."
+          exit 1
+        fi
+        for junk in node_modules .next .git .turbo; do
+          [ -e "/tmp/bundle/$junk" ] && { echo "FATAL: $junk leaked into the bundle"; exit 1; }
+        done
+        echo "no environment files or build/vcs directories in the bundle"
+
+      # A bundle that cannot say what it is becomes unidentifiable the moment it is copied
+      # anywhere. Records the commit, which is otherwise unrecoverable from the zip.
+      - |
+        . /tmp/build.env
+        python3 - <<'PY' > /tmp/bundle/manifest.json
+        import json, os
+        print(json.dumps({
+            "app": "praimana",
+            "version": os.environ["VERSION"],
+            "commit": os.environ["COMMIT"],
+            "builtBy": "praimana--portal-publish pipeline",
+            "buildNumber": os.environ.get("CODEBUILD_BUILD_NUMBER"),
+            "contents": "whole repo minus .git/.next/node_modules - build input for PortalBuildProject",
+            "immutableKey": os.environ["KEY"],
+            "pointerKey": os.environ["POINTER"],
+            # Reaching this line means the gate guard passed, so when checks were enabled
+            # they also SUCCEEDED. The old field read RUN_CHECKS - it said "true" on a
+            # build whose tests had failed, which is worse than saying nothing.
+            "checksPassed": os.environ.get("RUN_CHECKS", "true") == "true",
+            "buildWith": "pnpm install --frozen-lockfile && pnpm run build",
+            "configuredBy": "PortalBuildProject environment variables (NEXT_PUBLIC_* are inlined into .env.production at build time)",
+        }, indent=2))
+        PY
+        cat /tmp/bundle/manifest.json
+
+      # ---- zip + publish ------------------------------------------------------------
+      # Immutable object first, pointer second. That order matters: if the build dies between
+      # the two, the pointer still names a bundle that exists rather than one that does not.
+      - |
+        . /tmp/build.env
+        ZIP=/tmp/portal-"$VERSION"-"$SHORT".zip
+        (cd /tmp/bundle && zip -qr "$ZIP" .)
+        echo "bundle: $(basename "$ZIP") ($(du -h "$ZIP" | cut -f1))"
+        aws s3 cp "$ZIP" "s3://$PORTAL_BUCKET/$KEY" \
+          --metadata "version=$VERSION,commit=$COMMIT,build=${CODEBUILD_BUILD_NUMBER:-unknown}"
+        echo "published immutable  s3://$PORTAL_BUCKET/$KEY"
+        # Server-side copy, so the pointer is bit-identical to the immutable object and the
+        # bundle is not uploaded twice.
+        aws s3 cp "s3://$PORTAL_BUCKET/$KEY" "s3://$PORTAL_BUCKET/$POINTER" \
+          --metadata-directive REPLACE \
+          --metadata "version=$VERSION,commit=$COMMIT,build=${CODEBUILD_BUILD_NUMBER:-unknown}"
+        echo "updated   pointer    s3://$PORTAL_BUCKET/$POINTER"
+        aws s3 cp /tmp/bundle/manifest.json \
+          "s3://$PORTAL_BUCKET/${PORTAL_PREFIX}${VERSION}/manifest.json"
+        echo "ZIP=$ZIP" >> /tmp/build.env
+
+      # Read back rather than trusting the copy - a truncated or interrupted upload is
+      # otherwise invisible until a consumer tries to unzip it. Both keys are checked: the
+      # pointer is a separate S3 object, so verifying only the immutable one would leave the
+      # key consumers actually fetch unverified.
+      - |
+        . /tmp/build.env
+        local_size=$(wc -c < "$ZIP")
+        for k in "$KEY" "$POINTER"; do
+          remote_size=$(aws s3api head-object --bucket "$PORTAL_BUCKET" --key "$k" \
+                          --query ContentLength --output text)
+          printf '  %-52s local=%s remote=%s\n' "$k" "$local_size" "$remote_size"
+          [ "$local_size" = "$remote_size" ] || { echo "FATAL: size differs for $k"; exit 1; }
+        done
+        echo "verified both keys"
+        aws s3 ls "s3://$PORTAL_BUCKET/${PORTAL_PREFIX}${VERSION}/"

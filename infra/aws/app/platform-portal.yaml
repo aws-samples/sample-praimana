@@ -1,0 +1,1072 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Praimana - the App-account portal tier: the Next.js portal on Lambda with the
+  Lambda Web Adapter, fronted by CloudFront with static assets on S3, plus the CodeBuild project
+  that builds the published source zip in this account and deploys it. No Amplify, no Git.
+
+Parameters:
+  KmsKeyArn:
+    Type: String
+    Description: >
+      ARN of the customer-managed KMS key from platform-kms.yaml (tier 0). REQUIRED, no
+      default. Enables a customer-managed KMS key for encryption at rest.
+
+      ⚠ REQUIRED RATHER THAN OPTIONAL ON PURPOSE. An optional key would mean wrapping every
+      encryption property in an Fn::If, and neither cfn_nag nor checkov can resolve an
+      intrinsic - the findings this exists to clear would stay open, exactly as W73 did for
+      the BillingMode parameter. A required parameter is the only shape that both encrypts
+      and closes the finding.
+
+      ⚠ Pass the full ARN, not a key id and not an alias: an alias can be repointed at a
+      different key without this stack changing.
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+$"
+    ConstraintDescription: Must be a full KMS key ARN from the tier-0 KMS stack.
+
+  Environment:
+    Type: String
+    Description: Environment tag. REQUIRED, no default - a wrong tag corrupts cost allocation.
+    AllowedValues: ["dev", "test", "staging", "prod", "shared"]
+
+  ApiId:
+    Type: String
+    Description: ApiId output of platform-api.yaml. Becomes the portal's BACKEND_URL.
+    AllowedPattern: "^[a-z0-9]{8,20}$"
+
+  UserPoolId:
+    Type: String
+    Description: UserPoolId output of platform-identity.yaml. Drives COGNITO_ISSUER and the CSP.
+    AllowedPattern: "^[a-z]{2}-[a-z]+-[0-9]{1}_[A-Za-z0-9]+$"
+
+  UserPoolClientId:
+    Type: String
+    Description: UserPoolClientId output of platform-identity.yaml.
+    AllowedPattern: "^[a-z0-9]{16,64}$"
+
+  CognitoDomainPrefix:
+    Type: String
+    Description: REQUIRED. Hosted-UI prefix, same value as platform-identity.yaml. No account-id fallback.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+    ConstraintDescription: Required. Lowercase alphanumerics and dashes.
+
+  PortalBucket:
+    Type: String
+    Description: >
+      REQUIRED. Your portal bucket (praimana-portal<BucketNameSuffix> from
+      infra/aws/shared/platform-buckets.yaml) holding the published portal SOURCE zip. No
+      default: the shared stack always appends a suffix, so an unsuffixed default never names
+      a real bucket.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+
+  ResourcesBucketName:
+    Type: String
+    Description: >
+      The workshop-resources bucket (ResourcesBucketName output of platform-plumbing.yaml). Inlined into
+      the browser bundle as NEXT_PUBLIC_RESOURCES_BUCKET so the Content-Security-Policy can name the
+      EXACT S3 host the browser PUTs multipart parts to.
+
+      ⚠ WITHOUT THIS, UPLOADS FAIL WITH A BARE "Failed to fetch" AND NOTHING NAMES THE CAUSE. connect-src
+      is 'self' plus the Cognito IDP host; S3 is a third origin, so the browser refuses the fetch before
+      a packet leaves. A 100MB upload cannot go through the BFF instead - it exceeds API Gateway's 10MB
+      and Lambda's 6MB - so direct-to-S3 is the only shape available and the policy has to permit it.
+
+      ⚠ EMPTY IS VALID and means this deployment has no resource storage: the Workshop service answers
+      501 on every resource route, so there is nothing for the browser to reach and the directive stays
+      narrow. src/lib/csp.ts validates the value against S3 naming rules before interpolating it - an
+      unvalidated value in a CSP can append directives.
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be empty, or a valid S3 bucket name.
+
+  PortalBundlePrefix:
+    Type: String
+    Description: Prefix under PortalBucket where the source zip lives.
+    Default: "portal/"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9!_.'()-]*(/[a-zA-Z0-9!_.'()-]+)*/$"
+
+  PortalReleaseVersion:
+    Type: String
+    Description: >
+      Portal release to build, at <PortalBundlePrefix><version>/portal-<version>.zip. This is the
+      portal package.json version VERBATIM, and it takes the same form as
+      platform-api.yaml's ReleaseVersion - no leading "v" in either. The API
+      tier's S3 layout does carry one, but that "v" is a literal in its own CodeUri keys
+      rather than something a human has to remember to type.
+    Default: "1.0.0"
+    AllowedPattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+
+  BackendDomainName:
+    Type: String
+    Description: >
+      Custom hostname of the SERVICE API this portal calls, e.g. api.example.com — the DomainName
+      of platform-api.yaml when its EnableCustomDomain is true. EMPTY (the default) uses the raw
+      execute-api invoke URL derived from ApiId, which always works and needs no DNS.
+
+      ⚠ PREFER THE CUSTOM DOMAIN ONCE IT EXISTS. The invoke URL bypasses the custom domain, its
+      ACM certificate and its API mapping entirely, so nothing the portal does would notice any of
+      those breaking — a lapsed certificate would take every other client down while the portal
+      carried on. Pointing here is what makes the portal exercise the path real clients use.
+
+      ⚠ CHANGING THIS NEEDS NO REBUILD. It is set on the portal FUNCTION as well as in the build,
+      and the function's value is what a request reads (see the note on PortalFunction). The build
+      copy only has to be valid, because next build evaluates src/lib/backend.ts while collecting
+      page data and its module-scope assertion rejects an empty value.
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]*[a-z0-9]$"
+    ConstraintDescription: Must be empty or a lowercase hostname, with no scheme and no trailing dot.
+
+  PortalDomainName:
+    Type: String
+    Description: >
+      REQUIRED. Custom hostname the portal is served on, e.g. portal.example.com. PortalCertificateArn
+      must cover it.
+
+      ⚠ REQUIRED BECAUSE OF THE TLS FLOOR. With the default *.cloudfront.net certificate CloudFront
+      fixes the viewer security policy at TLSv1 and rejects a MinimumProtocolVersion override, so
+      TLS 1.0 and 1.1 clients would be accepted (RFC 8996 deprecates both). An alias with its own ACM
+      certificate is the only configuration that allows TLSv1.2_2021, which this stack always applies.
+
+      ⚠ DNS IS YOURS TO CREATE. After the deploy, point this hostname at the PortalDistributionDomainName
+      output (Route 53 alias, or a CNAME at another DNS provider). Until then the portal does not resolve.
+
+      ⚠ IT IS BAKED INTO THE BUNDLE, NOT JUST THE EDGE. NEXTAUTH_URL below is written into
+      .env.production at BUILD time and the Cognito callback is derived from it, so changing this
+      requires re-running the build project - a CloudFormation update alone leaves the previous
+      URL compiled into the running function, and sign-in then redirects to the old host.
+    AllowedPattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+    ConstraintDescription: Required. A lowercase fully-qualified hostname, with no scheme and no trailing dot.
+
+  EnablePortalWaf:
+    Type: String
+    Description: >
+      Whether the portal distribution gets a WAF WebACL. ⚠ THE CUSTOMER PAYS FOR THIS — WAF bills
+      per WebACL per month AND per million requests, on top of CloudFront. It is on by default
+      because the portal is the internet-facing edge of an app whose users can read every team's
+      work, and because teams competing under judged evaluation have an incentive to scrape or
+      disrupt rivals during a live event. Set false for a deployment where that is not a concern.
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  PortalWafRateLimitPer5Min:
+    Type: Number
+    Description: >
+      Requests per rolling 5 minutes, per IP, before the rate-based rule blocks. ⚠ A STARTING
+      POINT, NOT A MEASURED VALUE — sized with generous headroom over a legitimate facilitator
+      session (an SSR page load plus its tRPC batches, repeated across a workshop's screens) and
+      well under scraping volume. It is a parameter rather than a literal so it can be corrected
+      from load-test evidence without a template change. WAF's floor is 100.
+    Default: 600
+    MinValue: 100
+    MaxValue: 2000000
+
+  PortalWebAclArn:
+    Type: String
+    Description: >
+      A pre-made CLOUDFRONT-scoped WebACL to attach instead of creating one. ⚠ REQUIRED IF THIS
+      STACK IS NOT DEPLOYED IN us-east-1 — a CloudFront-scoped WebACL can only exist there, so a
+      stack in another region cannot create its own and must be handed an ARN. Same constraint as
+      PortalCertificateArn above, and the same failure if ignored.
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:wafv2:us-east-1:[0-9]{12}:global/webacl/[\\w-]+/[a-f0-9-]+$"
+    ConstraintDescription: Must be empty or a CLOUDFRONT-scoped WAFv2 WebACL ARN in us-east-1.
+
+  PortalCertificateArn:
+    Type: String
+    Description: >
+      REQUIRED. Issued ACM certificate covering PortalDomainName. ⚠ MUST BE IN us-east-1 REGARDLESS
+      OF WHERE THIS STACK IS DEPLOYED - CloudFront reads certificates only from us-east-1, and a
+      certificate in the stack's own region fails at create with an unhelpful error.
+    AllowedPattern: "^arn:aws[a-z-]*:acm:us-east-1:[0-9]{12}:certificate/[a-f0-9-]+$"
+    ConstraintDescription: Required. An ACM certificate ARN in us-east-1.
+
+  LwaLayerArn:
+    Type: String
+    Description: >
+      Lambda Web Adapter layer. Version 27 is LWA 1.0.0, resolved against the live public layer
+      rather than guessed. AWS publishes these per-region from account 753240598075; for another
+      region substitute the region in this ARN, and confirm a version exists with
+      `aws lambda get-layer-version --layer-name <arn> --version-number <n>` - ListLayerVersions is
+      not permitted on the public layer, so probing by version is the only way to check.
+    Default: "arn:aws:lambda:us-east-1:753240598075:layer:LambdaAdapterLayerX86:27"
+
+  PortalMemoryMb:
+    Type: Number
+    Description: >
+      SSR is CPU-bound and Lambda scales CPU with memory, so this is a latency setting more than a
+      memory one. 1769 MB is one full vCPU.
+    Default: 1769
+    MinValue: 512
+    MaxValue: 10240
+
+Conditions:
+  InUsEast1: !Equals [!Ref "AWS::Region", "us-east-1"]
+  HasSuppliedWebAcl: !Not [!Equals [!Ref PortalWebAclArn, ""]]
+  WafRequested: !Equals [!Ref EnablePortalWaf, "true"]
+  CreateWebAcl: !And [!Condition WafRequested, !Condition InUsEast1, !Not [!Condition HasSuppliedWebAcl]]
+  HasWebAcl: !Or [!Condition HasSuppliedWebAcl, !Condition CreateWebAcl]
+  HasBackendDomain: !Not [!Equals [!Ref BackendDomainName, ""]]
+
+Resources:
+  PortalStaticBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub
+        - "praimana-portal-static-${StackSuffix}"
+        - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LoggingConfiguration:
+        DestinationBucketName: !Ref PortalAccessLogBucket
+        LogFilePrefix: portal-static/
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+        - { Key: auto-delete, Value: "never" }
+
+  PortalStaticBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PortalStaticBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${PortalStaticBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${PortalStaticBucket}/*"
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+          - Sid: CloudFrontRead
+            Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: "s3:GetObject"
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${PortalStaticBucket}/*"
+            Condition:
+              StringEquals:
+                "AWS:SourceArn": !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${PortalDistribution}"
+
+  PortalBundleBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub
+        - "praimana-portal-bundles-${StackSuffix}"
+        - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      VersioningConfiguration: { Status: Enabled }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-bundles
+            Status: Enabled
+            ExpirationInDays: 14
+            NoncurrentVersionExpiration: { NoncurrentDays: 14 }
+          - Id: clean-expired-delete-markers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+          - { Id: abort-incomplete-uploads, Status: Enabled, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 } }
+      LoggingConfiguration:
+        DestinationBucketName: !Ref PortalAccessLogBucket
+        LogFilePrefix: portal-bundles/
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+        - { Key: auto-delete, Value: "never" }
+
+  PortalBundleBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PortalBundleBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${PortalBundleBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${PortalBundleBucket}/*"
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+
+  PortalSessionSecret:
+    Type: AWS::SecretsManager::Secret
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV2_AWS_57
+            comment: >-
+              Automatic rotation not configured. The key signs session cookies, and rotating it
+              without an overlap signs every user out, so rotation is an operator procedure that
+              sets NEXTAUTH_SECRET_PREVIOUS for the overlap window (portal/README.md, Secret
+              management). A rotation Lambda cannot run that two-step change safely.
+    Properties:
+      Description: >-
+        Praimana portal session-signing key (NEXTAUTH_SECRET). JSON with NEXTAUTH_SECRET and,
+        during a rotation only, NEXTAUTH_SECRET_PREVIOUS. Read by the portal function at cold start.
+      KmsKeyId: !Ref KmsKeyArn
+      GenerateSecretString:
+        SecretStringTemplate: "{}"
+        GenerateStringKey: NEXTAUTH_SECRET
+        PasswordLength: 64
+        ExcludePunctuation: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+        - { Key: auto-delete, Value: "never" }
+
+  PortalFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: !Sub "/aws/lambda/praimana-portal-${Environment}"
+      RetentionInDays: 30
+
+  PortalFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PortalFunctionAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${PortalFunctionLogGroup}:*"
+              - Effect: Allow
+                Action: ["kms:Decrypt", "kms:DescribeKey"]
+                Resource: !Ref KmsKeyArn
+              - Sid: ReadSessionSecret
+                Effect: Allow
+                Action: ["secretsmanager:GetSecretValue"]
+                Resource: !Ref PortalSessionSecret
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+        - { Key: auto-delete, Value: "never" }
+
+  PortalFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W58
+            reason: >-
+              False positive with the mechanism named: this role HAS logs:CreateLogStream and
+              logs:PutLogEvents inline, scoped to its own log group ARN - strictly TIGHTER than
+              the fleet default, which grants them via AWSLambdaBasicExecutionRole on Resource
+              '*'. logs:CreateLogGroup is deliberately omitted because the log group is
+              pre-created as its own CloudFormation resource, so the function never needs to
+              create one. This rule checks for all three actions of the basic-execution triple.
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.
+              Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: !Sub "praimana-portal-${Environment}"
+      Description: >-
+        Next.js portal, served by its own standalone server under the Lambda Web Adapter.
+      Role: !GetAtt PortalFunctionRole.Arn
+      Runtime: nodejs22.x
+      Architectures: [x86_64]
+      Handler: run.sh
+      MemorySize: !Ref PortalMemoryMb
+      Timeout: 30
+      Layers: [!Ref LwaLayerArn]
+      LoggingConfig: { LogGroup: !Ref PortalFunctionLogGroup }
+      Code:
+        ZipFile: |
+          // Placeholder. Replaced by the build with the Next standalone server.
+          exports.handler = async () => ({ statusCode: 503, body: "portal not built yet" });
+      Environment:
+        Variables:
+          AWS_LAMBDA_EXEC_WRAPPER: /opt/bootstrap
+          PORT: "3000"
+          AWS_LWA_PORT: "3000"
+          AWS_LWA_INVOKE_MODE: buffered
+          BACKEND_URL: !If [HasBackendDomain, !Sub "https://${BackendDomainName}", !Sub "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com"]
+          DESKTOP_API_BASE_URL: !If [HasBackendDomain, !Sub "https://${BackendDomainName}", !Sub "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com"]
+          NEXT_PUBLIC_BACKEND_URL: !If [HasBackendDomain, !Sub "https://${BackendDomainName}", !Sub "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com"]
+          NEXTAUTH_SECRET_ARN: !Ref PortalSessionSecret
+          NODE_ENV: production
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+        - { Key: auto-delete, Value: "never" }
+
+  PortalApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "praimana-portal-${Environment}"
+      Description: Fronts the portal Lambda. Separate from the service API on purpose - see above.
+      ProtocolType: HTTP
+      Tags:
+        Environment: !Ref Environment
+        ApplicationName: Praimana
+        auto-delete: never
+
+  PortalApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref PortalApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt PortalFunction.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 29000
+
+  PortalApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref PortalApi
+      RouteKey: $default
+      Target: !Sub "integrations/${PortalApiIntegration}"
+
+  PortalApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/portal-api-access
+      RetentionInDays: 30
+
+  PortalApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    DependsOn: PortalApiAccessLogGroup
+    Properties:
+      ApiId: !Ref PortalApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 100
+        ThrottlingBurstLimit: 200
+        DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/praimana/portal-api-access"
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","path":"$context.path","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","responseLatency":"$context.responseLatency","integrationStatus":"$context.integrationStatus","integrationLatency":"$context.integrationLatency","integrationErrorMessage":"$context.integrationErrorMessage","authorizerError":"$context.authorizer.error"}'
+
+  PortalApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PortalFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${PortalApi}/*/*"
+
+  PortalS3Oac:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "praimana-portal-s3-${Environment}"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  PortalOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: !Sub "praimana-portal-origin-${Environment}"
+        Comment: All viewer headers except Host and Authorization, for a SigV4-signed Lambda origin.
+        HeadersConfig:
+          HeaderBehavior: allExcept
+          Headers: [host, authorization]
+        CookiesConfig: { CookieBehavior: all }
+        QueryStringsConfig: { QueryStringBehavior: all }
+
+  PortalWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Condition: CreateWebAcl
+    Properties:
+      Name: !Sub "praimana-portal-${Environment}"
+      Scope: CLOUDFRONT
+      Description: Baseline managed rules and a per-IP rate limit for the facilitator portal.
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "praimana-portal-${Environment}"
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 0
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: common-rule-set
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: known-bad-inputs
+        - Name: PerIpRateLimit
+          Priority: 2
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement:
+              Limit: !Ref PortalWafRateLimitPer5Min
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: per-ip-rate-limit
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+
+  PortalDistribution:
+    Type: AWS::CloudFront::Distribution
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W10
+            reason: >-
+              CloudFront standard logging v2 is deployed via AWS::Logs::Delivery*. The v1
+              Logging property this rule checks requires S3 ACLs, disabled by
+              BucketOwnerEnforced - adding it would silently break delivery. See
+              PortalAccessLogSource, PortalAccessLogDestination and PortalAccessLogDelivery
+              in this template.
+      checkov:
+        skip:
+          - id: CKV_AWS_86
+            comment: >-
+              CloudFront standard logging v2 IS deployed
+              (AWS::Logs::DeliverySource/DeliveryDestination/Delivery to PortalAccessLogBucket).
+              These rules only inspect the LEGACY v1 Logging property, which delivers via an S3
+              ACL - and every bucket here sets ObjectOwnership BucketOwnerEnforced, which
+              disables ACLs. Adding v1 would deploy green and never deliver a single file.
+      cfn-lint: { config: { ignore_checks: [W1030] } }
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        WebACLId: !If
+          - HasWebAcl
+          - !If [HasSuppliedWebAcl, !Ref PortalWebAclArn, !GetAtt PortalWebAcl.Arn]
+          - !Ref "AWS::NoValue"
+        Comment: !Sub "Praimana portal (${Environment})"
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Aliases: [!Ref PortalDomainName]
+        ViewerCertificate:
+          AcmCertificateArn: !Ref PortalCertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: api
+            DomainName: !Sub "${PortalApi}.execute-api.${AWS::Region}.amazonaws.com"
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+          - Id: s3
+            DomainName: !GetAtt PortalStaticBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt PortalS3Oac.Id
+            S3OriginConfig: { OriginAccessIdentity: "" }
+        DefaultCacheBehavior:
+          TargetOriginId: api
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          Compress: true
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: !Ref PortalOriginRequestPolicy
+        CacheBehaviors:
+          - PathPattern: /_next/static/*
+            TargetOriginId: s3
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        CustomErrorResponses:
+          - { ErrorCode: 403, ResponseCode: 404, ResponsePagePath: /404, ErrorCachingMinTTL: 0 }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+        - { Key: auto-delete, Value: "never" }
+
+  PortalAccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >-
+              This bucket IS the log-delivery target. Self-logging recurses unboundedly.
+              Cross-pointing was evaluated and is blocked by S3's
+              same-account-and-Region requirement for server access logging across this
+              three-account platform.
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              This bucket IS the log-delivery target for the platform's other buckets.
+              Self-logging recurses: every delivered log object is itself an event to be logged.
+              Residual stated openly - reads of the access logs are not themselves audited; if
+              that is required the answer is CloudTrail data events, not self-referential S3
+              logging.
+    Properties:
+      BucketName: !Sub
+        - "praimana-portal-access-logs-${StackSuffix}"
+        - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - { Id: expire-access-logs, Status: Enabled, ExpirationInDays: 90, NoncurrentVersionExpiration: { NoncurrentDays: 90 } }
+          - { Id: clean-expired-delete-markers, Status: Enabled, ExpiredObjectDeleteMarker: true }
+          - { Id: abort-incomplete-uploads, Status: Enabled, AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 } }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+        - { Key: auto-delete, Value: "never" }
+
+  PortalAccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PortalAccessLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${PortalAccessLogBucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${PortalAccessLogBucket}/*"
+            Condition: { Bool: { "aws:SecureTransport": "false" } }
+          - Sid: AllowVendedLogDelivery
+            Effect: Allow
+            Principal: { Service: delivery.logs.amazonaws.com }
+            Action: "s3:PutObject"
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${PortalAccessLogBucket}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:delivery-source:*"
+          - Sid: AllowS3LogDeliveryPortalStatic
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: "s3:PutObject"
+            Resource: !Sub "${PortalAccessLogBucket.Arn}/portal-static/*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub
+                  - "arn:${AWS::Partition}:s3:::praimana-portal-static-${StackSuffix}"
+                  - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+          - Sid: AllowS3LogDeliveryPortalBundles
+            Effect: Allow
+            Principal: { Service: logging.s3.amazonaws.com }
+            Action: "s3:PutObject"
+            Resource: !Sub "${PortalAccessLogBucket.Arn}/portal-bundles/*"
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Ref AWS::AccountId
+              ArnLike:
+                "aws:SourceArn": !Sub
+                  - "arn:${AWS::Partition}:s3:::praimana-portal-bundles-${StackSuffix}"
+                  - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+
+  PortalAccessLogSource:
+    Type: AWS::Logs::DeliverySource
+    Properties:
+      Name: !Sub "praimana-portal-access-${Environment}"
+      LogType: ACCESS_LOGS
+      ResourceArn: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${PortalDistribution}"
+
+  PortalAccessLogDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: !Sub "praimana-portal-access-dest-${Environment}"
+      DestinationResourceArn: !GetAtt PortalAccessLogBucket.Arn
+      OutputFormat: json
+
+  PortalAccessLogDelivery:
+    Type: AWS::Logs::Delivery
+    DependsOn: PortalAccessLogBucketPolicy
+    Properties:
+      DeliverySourceName: !Ref PortalAccessLogSource
+      DeliveryDestinationArn: !GetAtt PortalAccessLogDestination.Arn
+
+  PortalBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: !Sub "/aws/codebuild/praimana-portal-build-${Environment}"
+      RetentionInDays: 30
+
+  PortalBuildRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W76
+            reason: >-
+              Advisory complexity metric (SPCM > 25) on a policy that is already narrowed to one
+              statement per resource, each with an explicit Sid and no wildcard. SPCM penalises
+              exactly the fine-grained shape least privilege asks for.
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/praimana-portal-build-${Environment}"
+      Policies:
+        - PolicyName: PortalBuildAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: ["logs:CreateLogStream", "logs:PutLogEvents"]
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:${PortalBuildLogGroup}:*"
+              - Sid: UsePlatformKey
+                Effect: Allow
+                Action: ["kms:Encrypt", "kms:Decrypt", "kms:ReEncrypt*", "kms:GenerateDataKey*", "kms:DescribeKey"]
+                Resource: !Ref KmsKeyArn
+              - Sid: ReadPublishedSource
+                Effect: Allow
+                Action: ["s3:GetObject", "s3:GetObjectVersion"]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${PortalBucket}/${PortalBundlePrefix}*"
+              - Sid: WriteBundle
+                Effect: Allow
+                Action: ["s3:PutObject", "s3:GetObject", "s3:AbortMultipartUpload"]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${PortalBundleBucket}/bundles/*"
+              - Sid: PublishStatic
+                Effect: Allow
+                Action: ["s3:PutObject", "s3:DeleteObject", "s3:GetObject"]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${PortalStaticBucket}/*"
+              - Sid: ListStatic
+                Effect: Allow
+                Action: ["s3:ListBucket"]
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${PortalStaticBucket}"
+              - Sid: ShipCode
+                Effect: Allow
+                Action: ["lambda:UpdateFunctionCode", "lambda:GetFunction", "lambda:GetFunctionConfiguration"]
+                Resource: !GetAtt PortalFunction.Arn
+              - Sid: Invalidate
+                Effect: Allow
+                Action: ["cloudfront:CreateInvalidation", "cloudfront:GetInvalidation"]
+                Resource: !Sub "arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${PortalDistribution}"
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+        - { Key: auto-delete, Value: "never" }
+
+  PortalBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      EncryptionKey: !Ref KmsKeyArn
+      Name: !Sub "praimana-portal-build-${Environment}"
+      Description: >-
+        Builds the published portal source zip with this account's values, ships it to the portal
+        Lambda, publishes static assets to S3 and invalidates CloudFront.
+      ServiceRole: !GetAtt PortalBuildRole.Arn
+      Artifacts: { Type: NO_ARTIFACTS }
+      TimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs: { Status: ENABLED, GroupName: !Ref PortalBuildLogGroup }
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - { Name: SOURCE_BUCKET,  Type: PLAINTEXT, Value: !Ref PortalBucket }
+          - { Name: SOURCE_KEY,     Type: PLAINTEXT, Value: !Sub "${PortalBundlePrefix}${PortalReleaseVersion}/portal-${PortalReleaseVersion}.zip" }
+          - { Name: BUNDLE_BUCKET,  Type: PLAINTEXT, Value: !Ref PortalBundleBucket }
+          - { Name: STATIC_BUCKET,  Type: PLAINTEXT, Value: !Ref PortalStaticBucket }
+          - { Name: FUNCTION_NAME,  Type: PLAINTEXT, Value: !Ref PortalFunction }
+          - { Name: DISTRIBUTION_ID, Type: PLAINTEXT, Value: !Ref PortalDistribution }
+          - { Name: NEXTAUTH_URL,   Type: PLAINTEXT, Value: !Sub "https://${PortalDomainName}" }
+          - { Name: NEXTAUTH_SECRET, Type: PLAINTEXT, Value: "build-only-placeholder-not-a-secret" }
+          - { Name: AUTH_TRUST_HOST, Type: PLAINTEXT, Value: "true" }
+          - { Name: COGNITO_ISSUER, Type: PLAINTEXT, Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}" }
+          - { Name: COGNITO_CLIENT_ID, Type: PLAINTEXT, Value: !Ref UserPoolClientId }
+          - { Name: COGNITO_CLIENT_SECRET, Type: PLAINTEXT, Value: "" }
+          - { Name: COGNITO_HOSTED_UI_DOMAIN, Type: PLAINTEXT, Value: !Sub "https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com" }
+          - { Name: BACKEND_URL,    Type: PLAINTEXT, Value: !If [HasBackendDomain, !Sub "https://${BackendDomainName}", !Sub "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com"] }
+          - { Name: DESKTOP_API_BASE_URL, Type: PLAINTEXT, Value: !If [HasBackendDomain, !Sub "https://${BackendDomainName}", !Sub "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com"] }
+          - { Name: NEXT_PUBLIC_BACKEND_URL, Type: PLAINTEXT, Value: !If [HasBackendDomain, !Sub "https://${BackendDomainName}", !Sub "https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com"] }
+          - { Name: NEXT_PUBLIC_COGNITO_USER_POOL_ID, Type: PLAINTEXT, Value: !Ref UserPoolId }
+          - { Name: NEXT_PUBLIC_COGNITO_CLIENT_ID, Type: PLAINTEXT, Value: !Ref UserPoolClientId }
+          - { Name: NEXT_PUBLIC_RESOURCES_BUCKET, Type: PLAINTEXT, Value: !Ref ResourcesBucketName }
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 22
+            pre_build:
+              commands:
+                - |
+                  set -e
+                  aws s3 cp "s3://$SOURCE_BUCKET/$SOURCE_KEY" /tmp/src.zip
+                  mkdir -p /src && unzip -q /tmp/src.zip -d /src
+                  test -f /src/package.json || { echo "FATAL: $SOURCE_KEY has no package.json at its root - not a portal source zip"; exit 1; }
+                  test -d /src/src || { echo "FATAL: no src/ - this does not look like the portal"; exit 1; }
+            build:
+              commands:
+                - |
+                  set -e
+                  cd /src
+                  corepack enable
+                  corepack prepare "$(node -p "require('./package.json').packageManager")" --activate
+                  pnpm install --frozen-lockfile
+                - |
+                  set -e
+                  cd /src
+                  # ⚠ THE BACKEND URLS ARE HERE **AND** ON THE FUNCTION, AND BOTH ARE REQUIRED.
+                  # Here because next build evaluates src/lib/backend.ts while collecting page data
+                  # and its module-scope assertion throws on an empty value. On the function because
+                  # that is what a request actually reads, so the API can be repointed with a stack
+                  # update and no rebuild. @next/env does not override an already-set variable, so
+                  # the function's value wins at runtime.
+                  # ⚠ THE COST: a stale value here no longer fails anything, because the function
+                  # overrides it. If the portal is talking to the wrong API, check the FUNCTION.
+                  # ── ⚠ NEXTAUTH_SECRET IS DELIBERATELY ABSENT FROM BOTH LISTS ──────────────────
+                  #
+                  # A SECURITY FINDING: the session-signing secret was once carried as a CodeBuild
+                  # PLAINTEXT variable and baked into .env.production inside the Lambda artifact
+                  # in S3. Writing it here put the session-signing key — which
+                  # session-cookie.ts calls "equivalent to minting a session for any user at any
+                  # role" — inside the zip and therefore inside the bundle bucket, recoverable with
+                  # s3:GetObject or lambda:GetFunction. It lives in Secrets Manager (PortalSessionSecret)
+                  # and lambda/load-session-secret.cjs reads it at cold start.
+                  #
+                  # ⚠ ADDING IT BACK "so the build has it" WOULD UNDO THE FIX AND LOOK HARMLESS.
+                  # The build DOES have it — as a labelled placeholder on the project — and that
+                  # placeholder must not reach this file: with it here, a failed secret read
+                  # would silently fall back to a value committed to this repo and sessions would be
+                  # signed with a publicly-known key. Absent, the server fails with NextAuth's
+                  # MissingSecret, which is the failure you want.
+                  rm -f .env.production
+                  echo "NODE_ENV=production" >> .env.production
+                  for k in NEXTAUTH_URL AUTH_TRUST_HOST COGNITO_ISSUER COGNITO_CLIENT_ID \
+                           COGNITO_CLIENT_SECRET COGNITO_HOSTED_UI_DOMAIN BACKEND_URL DESKTOP_API_BASE_URL \
+                           NEXT_PUBLIC_BACKEND_URL NEXT_PUBLIC_COGNITO_USER_POOL_ID NEXT_PUBLIC_COGNITO_CLIENT_ID \
+                           NEXT_PUBLIC_RESOURCES_BUCKET; do
+                    printf '%s=%s\n' "$k" "$(printenv "$k")" >> .env.production
+                  done
+                  printf 'NEXT_PUBLIC_APP_URL=%s\n' "$NEXTAUTH_URL" >> .env.production
+                  for k in NEXTAUTH_URL AUTH_TRUST_HOST COGNITO_ISSUER COGNITO_CLIENT_ID \
+                           BACKEND_URL NODE_ENV NEXT_PUBLIC_COGNITO_USER_POOL_ID NEXT_PUBLIC_COGNITO_CLIENT_ID; do
+                    grep -Eq "^$k=.+" .env.production || { echo "FATAL: $k missing or empty in .env.production"; exit 1; }
+                  done
+                  # The assertion that replaces it: the secret must NOT be in the artifact. A
+                  # regression here is otherwise invisible — the build succeeds either way.
+                  ! grep -q '^NEXTAUTH_SECRET=' .env.production || {
+                    echo "FATAL: NEXTAUTH_SECRET was written into .env.production."
+                    echo "       It belongs in Secrets Manager, not in the artifact - see platform-portal.yaml."
+                    exit 1; }
+                  echo "runtime vars written:"; cut -d= -f1 .env.production | sort | sed 's/^/  - /'
+                  echo "  (NEXTAUTH_SECRET intentionally absent - read from Secrets Manager at cold start)"
+                - |
+                  set -e
+                  cd /src && pnpm run build
+                  test -f .next/standalone/server.js || { echo "FATAL: no .next/standalone/server.js - next.config.ts is missing output: standalone"; exit 1; }
+            post_build:
+              commands:
+                - |
+                  set -e
+                  if [ "${CODEBUILD_BUILD_SUCCEEDING:-1}" != "1" ]; then
+                    echo "REFUSING TO SHIP: the build failed above."; exit 1
+                  fi
+                - |
+                  set -e
+                  cd /src
+                  # ── the Lambda package ──
+                  # standalone is self-contained EXCEPT for .next/static and public, which it expects
+                  # to find on disk beside it. run.sh is what LWA executes as the handler; it starts
+                  # load-session-secret.cjs, which reads the session key from Secrets Manager and
+                  # then requires server.js.
+                  rm -rf /pkg && mkdir -p /pkg
+                  cp -r .next/standalone/. /pkg/
+                  mkdir -p /pkg/.next/static && cp -r .next/static/. /pkg/.next/static/
+                  if [ -d public ]; then cp -r public /pkg/; fi
+                  test -f lambda/load-session-secret.cjs || { echo "FATAL: lambda/load-session-secret.cjs missing from the portal source"; exit 1; }
+                  cp lambda/load-session-secret.cjs /pkg/load-session-secret.cjs
+                  printf '#!/bin/bash\nexec node load-session-secret.cjs\n' > /pkg/run.sh
+                  chmod +x /pkg/run.sh
+                  test -f /pkg/server.js || { echo "FATAL: server.js missing from the package root"; exit 1; }
+                  SZ=$(du -sm /pkg | cut -f1)
+                  echo "lambda package is ${SZ} MB uncompressed"
+                  # ⚠ 250 MB IS LAMBDA'S UNZIPPED LIMIT. Failing here names the cause.
+                  [ "$SZ" -lt 250 ] || { echo "FATAL: ${SZ} MB exceeds Lambda's 250 MB unzipped limit - move to a container image"; exit 1; }
+                - |
+                  set -e
+                  KEY="bundles/portal-${CODEBUILD_BUILD_NUMBER}.zip"
+                  cd /pkg && zip -qr /tmp/fn.zip .
+                  aws s3 cp /tmp/fn.zip "s3://$BUNDLE_BUCKET/$KEY" --only-show-errors
+                  echo "package at s3://$BUNDLE_BUCKET/$KEY ($(du -h /tmp/fn.zip | cut -f1))"
+                  aws lambda update-function-code --function-name "$FUNCTION_NAME" \
+                    --s3-bucket "$BUNDLE_BUCKET" --s3-key "$KEY" --no-cli-pager >/dev/null
+                  # ⚠ WAIT FOR THE UPDATE TO SETTLE. Invoking during Pending returns errors that look
+                  # like the app is broken.
+                  for i in $(seq 1 40); do
+                    S=$(aws lambda get-function-configuration --function-name "$FUNCTION_NAME" --query 'LastUpdateStatus' --output text)
+                    echo "  code update: $S"
+                    [ "$S" = "Successful" ] && break
+                    [ "$S" = "Failed" ] && { echo "FATAL: code update failed"; exit 1; }
+                    sleep 6
+                  done
+                - |
+                  set -e
+                  cd /src
+                  # Static assets. _next/static is content-hashed, so a long max-age is safe and the
+                  # invalidation below never needs to touch it.
+                  aws s3 sync .next/static "s3://$STATIC_BUCKET/_next/static" --delete \
+                    --cache-control "public, max-age=31536000, immutable" --only-show-errors
+                  if [ -d public ]; then
+                    aws s3 sync public "s3://$STATIC_BUCKET/" --exclude "_next/*" \
+                      --cache-control "public, max-age=300" --only-show-errors
+                  fi
+                  # Only the dynamic paths need invalidating; hashed assets change name instead.
+                  ID=$(aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" \
+                        --paths "/" "/index.html" --query 'Invalidation.Id' --output text)
+                  echo "invalidation $ID created"
+                  echo "portal shipped - $NEXTAUTH_URL"
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: "Praimana" }
+        - { Key: auto-delete, Value: "never" }
+
+Outputs:
+  PortalUrl:
+    Description: >
+      Where the portal is served. ⚠ Answers errors until the build project has run once - the
+      function is created with a placeholder because CloudFormation must create it before a built
+      artifact can exist.
+    Value: !Sub "https://${PortalDomainName}"
+
+  PortalDistributionDomainName:
+    Description: >
+      DNS target for PortalDomainName. Create a Route 53 alias record (or a CNAME at another DNS
+      provider) from PortalDomainName to this value; the portal does not resolve until you do.
+    Value: !GetAtt PortalDistribution.DomainName
+
+  PortalSessionSecretArn:
+    Description: >
+      Secrets Manager secret holding the session-signing key. Rotate it with put-secret-value,
+      then re-run the build project so new execution environments read it (portal/README.md,
+      Secret management).
+    Value: !Ref PortalSessionSecret
+
+  PortalBuildProjectName:
+    Description: >
+      Run with `aws codebuild start-build --project-name <this>`. Builds the published source with
+      this account's values, ships it to the function, publishes static assets and invalidates.
+    Value: !Ref PortalBuildProject
+
+  PortalFunctionName:
+    Description: The portal Lambda. Its log group carries the SSR logs.
+    Value: !Ref PortalFunction
+
+  PortalDistributionId:
+    Description: CloudFront distribution id.
+    Value: !Ref PortalDistribution
+
+  CognitoCallbackUrlForIdentityTier:
+    Description: >
+      Paste into platform-identity.yaml's CognitoCallbackUrls if the portal needs web sign-in. The
+      desktop app's loopback callback is separate and unaffected.
+    Value: !Sub "https://${PortalDomainName}/api/auth/callback/cognito"
+
+  PortalWafStatus:
+    Description: >
+      ⚠ READ THIS AFTER A DEPLOY OUTSIDE us-east-1. A CloudFront-scoped WebACL can only exist in
+      us-east-1, so a stack in any other region cannot create one. Rather than fail the deploy or
+      silently ship an unprotected distribution, this Output states which happened. "NOT ATTACHED"
+      means the portal is reachable with no edge rate limit — the PortalApiStage throttle still
+      applies, but per-IP fairness does not. Fix by creating a WebACL in us-east-1 and redeploying
+      with PortalWebAclArn set.
+    Value: !If
+      - HasWebAcl
+      - !If [HasSuppliedWebAcl, "ATTACHED (supplied ARN)", "ATTACHED (created by this stack)"]
+      - !If
+        - WafRequested
+        - "NOT ATTACHED — WAF requested but this stack is not in us-east-1; pass PortalWebAclArn"
+        - "NOT ATTACHED — EnablePortalWaf=false"

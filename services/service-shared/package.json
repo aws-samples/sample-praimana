@@ -1,0 +1,29 @@
+{
+  "name": "@praimana/service-shared",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT-0",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "type-check": "tsc --noEmit",
+    "lint": "eslint src/",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@praimana/shared": "workspace:*",
+    "@aws-sdk/client-dynamodb": "3.1113.0",
+    "@aws-sdk/client-eventbridge": "3.1113.0",
+    "@aws-sdk/client-lambda": "3.1113.0",
+    "@aws-sdk/lib-dynamodb": "3.1113.0",
+    "hono": "4.13.11",
+    "jose": "6.2.9"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "eslint": "9.39.5",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  }
+}

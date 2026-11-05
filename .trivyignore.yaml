@@ -1,0 +1,111 @@
+misconfigurations:
+  - id: AWS-0132
+    paths:
+      - "**/aws/app/platform-plumbing.yaml"
+    statement: >-
+      DocsBucket and ResourcesBucket use SSE-KMS with the platform customer-managed key
+      (KMSMasterKeyID: !Ref KmsKeyArn, a required parameter with no default); trivy cannot resolve
+      the !Ref, so it reports them. CanaryArtifactsBucket and DocsAccessLogBucket use SSE-S3 by
+      design: the first holds only synthetic canary output under a 30-day expiry, and S3 server
+      access logging only delivers to SSE-S3 destination buckets. The KMS setting on DocsBucket and
+      ResourcesBucket is pinned by services/identity/src/infra-guardrails.test.ts.
+
+  - id: AWS-0132
+    paths:
+      - "**/aws/app/platform-portal.yaml"
+    statement: >-
+      PortalStaticBucket serves public static assets (JS/CSS) to every visitor through CloudFront,
+      and PortalBundleBucket holds the built portal, compiled from this public source. Neither
+      holds customer data, and SSE-KMS behind CloudFront OAC would require the platform key policy
+      to admit the CloudFront service principal. PortalAccessLogBucket must be SSE-S3 because S3
+      server access logging only delivers to SSE-S3 destination buckets.
+
+  - id: AWS-0132
+    paths:
+      - "**/aws/shared/platform-buckets.yaml"
+    statement: >-
+      Supply-chain buckets for release artifacts built from this public source: Lambda zips,
+      desktop installers and source zip, portal source zip, and CloudFormation templates. They hold
+      no customer data. This stack deploys before the platform KMS tier, so no customer-managed key
+      exists for it; the buckets are private, versioned, delete-protected and TLS-only. The
+      access-log bucket must be SSE-S3 because S3 server access logging only delivers to SSE-S3
+      destination buckets.
+
+  - id: AWS-0095
+    paths:
+      - "**/aws/app/platform-observability.yaml"
+      - "**/aws/app/platform-ses.yaml"
+    statement: >-
+      False positive: every SNS topic sets KmsMasterKeyId: !Ref KmsKeyArn, a required parameter
+      with no default, which trivy cannot resolve.
+
+  - id: AWS-0096
+    paths:
+      - "**/aws/app/platform-plumbing.yaml"
+    statement: >-
+      False positive: the dead-letter queue sets KmsMasterKeyId: !Ref KmsKeyArn, a required
+      parameter with no default, which trivy cannot resolve.
+
+  - id: AWS-0011
+    paths:
+      - "**/aws/app/platform-portal.yaml"
+    statement: >-
+      False positive: PortalDistribution attaches WebACLId through !If. The portal WAF is created
+      by default (EnablePortalWaf) in us-east-1, or supplied via PortalWebAclArn elsewhere; the
+      PortalWafStatus output reports when neither applies.
+
+  - id: AWS-0017
+    paths:
+      - "**/aws/app/platform-api.yaml"
+      - "**/aws/app/platform-identity.yaml"
+      - "**/aws/app/platform-portal.yaml"
+    statement: >-
+      False positive: every log group sets KmsKeyId: !Ref KmsKeyArn, a required parameter with no
+      default (AllowedPattern pins a full KMS key ARN), which trivy cannot resolve. SECURITY.md T015
+      records CMK encryption on service log groups as a mitigation.
+
+  - id: AWS-0025
+    paths:
+      - "**/aws/app/platform-dynamodb.yaml"
+    statement: >-
+      False positive: all 35 tables set SSESpecification with SSEType: KMS and
+      KMSMasterKeyId: !Ref KmsKeyArn, a required parameter with no default (AllowedPattern pins a
+      full KMS key ARN, not an alias). trivy cannot resolve the !Ref and treats it as the default key.
+
+  - id: AWS-0098
+    paths:
+      - "**/aws/app/platform-portal.yaml"
+    statement: >-
+      False positive: PortalSessionSecret sets KmsKeyId: !Ref KmsKeyArn, a required parameter with
+      no default, which trivy cannot resolve.
+
+  - id: AWS-0125
+    paths:
+      - "**/aws/app/platform-api.yaml"
+      - "**/aws/app/platform-identity.yaml"
+    statement: >-
+      False positive: X-Ray tracing is enabled for every AWS::Serverless::Function in these
+      templates through Globals.Function.Tracing: Active. trivy evaluates each function without
+      applying SAM Globals.
+
+  - id: AWS-0089
+    paths:
+      - "**/aws/shared/platform-buckets.yaml"
+    statement: >-
+      AccessLogBucket is the server-access-log destination for the other supply-chain buckets.
+      Logging it to itself recurses (every delivered log object is a new event to log), and S3
+      requires the target bucket in the same account and Region. Reads of these logs are auditable
+      through CloudTrail data events instead. Also recorded in the resource's cfn_nag (W35) and
+      checkov (CKV_AWS_18) metadata.
+
+  - id: AWS-0066
+    paths:
+      - "**/aws/app/platform-portal.yaml"
+    statement: >-
+      Accepted by design: PortalFunction (the Next.js portal under the Lambda Web Adapter) ships
+      with X-Ray tracing off. It serves the UI only; every API call it makes goes to the backend
+      functions, which already trace through SAM Globals (Tracing: Active). Function errors,
+      duration and throttles remain visible in CloudWatch metrics and its CMK-encrypted log group.
+      Deployers who want end-to-end traces can enable it by adding TracingConfig: { Mode: Active }
+      to PortalFunction and granting PortalFunctionRole xray:PutTraceSegments and
+      xray:PutTelemetryRecords (or attaching the AWSXRayDaemonWriteAccess managed policy).

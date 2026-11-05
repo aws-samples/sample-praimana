@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Praimana KMS tier. One customer-managed key for DynamoDB tables, CloudWatch
+  log groups, Lambda environment variables, SNS topics, the dead-letter queue and CodeBuild.
+  Deploy before all other tiers. Reverses finding H1.
+
+Parameters:
+  Environment:
+    Type: String
+    Description: >
+      Environment tag. REQUIRED, no default - same reasoning as every other tier: a wrong
+      environment tag silently corrupts cost allocation and can mislead automated cleanup.
+    AllowedValues: ["dev", "test", "staging", "prod", "shared"]
+
+  KeyAdministratorArn:
+    Type: String
+    Default: ""
+    Description: >
+      OPTIONAL. IAM principal ARN permitted to administer this key - rotate it, change its
+      policy, schedule its deletion. Leave EMPTY to grant administration to the account root,
+      which means "whatever IAM in this account allows".
+
+      ⚠ SET THIS IN PRODUCTION. Leaving it empty is the convenient default, not the correct
+      one: it makes key administration reachable by any sufficiently-privileged IAM principal
+      in the account, which defeats one of the three things a CMK was adopted for - access
+      control at the key policy, INDEPENDENT of IAM. Naming a single break-glass role here is
+      what makes that property real.
+
+Conditions:
+  HasKeyAdministrator: !Not [!Equals [!Ref KeyAdministratorArn, ""]]
+
+Resources:
+  PlatformKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: !Sub "Praimana (${Environment}) - tables, logs, Lambda env vars, SNS, SQS, CodeBuild"
+      Enabled: true
+      EnableKeyRotation: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: KeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !If
+                - HasKeyAdministrator
+                - !Ref KeyAdministratorArn
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+            Resource: "*"
+
+          - Sid: AllowServiceUseViaIamFromThisAccountOnly
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref "AWS::AccountId"
+              ForAnyValue:StringEquals:
+                kms:ViaService:
+                  - !Sub "dynamodb.${AWS::Region}.amazonaws.com"
+                  - !Sub "lambda.${AWS::Region}.amazonaws.com"
+                  - !Sub "sqs.${AWS::Region}.amazonaws.com"
+                  - !Sub "sns.${AWS::Region}.amazonaws.com"
+                  - !Sub "s3.${AWS::Region}.amazonaws.com"
+                  - !Sub "codebuild.${AWS::Region}.amazonaws.com"
+                  - !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+
+          - Sid: AllowCloudWatchAlarmsToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:praimana-*"
+
+          - Sid: AllowEventBridgeToPublish
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: "*"
+
+          - Sid: AllowSesToPublish
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+
+          - Sid: AllowLogDelivery
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: praimana
+
+  PlatformKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/praimana
+      TargetKeyId: !Ref PlatformKey
+
+Outputs:
+  KmsKeyArn:
+    Description: >
+      Key ARN. Feed this to the KmsKeyArn parameter of platform-dynamodb, platform-plumbing,
+      platform-ses, platform-identity, platform-api, platform-portal and
+      platform-observability. Use the ARN, not the alias or the key id - DynamoDB's
+      KMSMasterKeyId and CodeBuild's EncryptionKey both want a full ARN.
+    Value: !GetAtt PlatformKey.Arn
+
+  KmsKeyId:
+    Description: Key id, for CloudTrail queries and for a ScheduleKeyDeletion metric filter.
+    Value: !Ref PlatformKey
+
+  KmsKeyAliasName:
+    Description: Alias, for human use and for the console. Not for template wiring.
+    Value: !Ref PlatformKeyAlias

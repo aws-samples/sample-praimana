@@ -1,0 +1,453 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --quiet cfn-lint==1.58.0 checkov==3.3.8
+
+  pre_build:
+    commands:
+      - |
+        test -f "$TEMPLATE_PATH" || { echo "template not found: $TEMPLATE_PATH"; exit 1; }
+      - |
+        set -e
+        test -n "$ARTIFACT_BUCKET" || { echo "ARTIFACT_BUCKET not set - see the ValidateProject in the CI/CD pipeline"; exit 1; }
+        STAGED_KEY="${ARTIFACT_PREFIX}validate/${CODEBUILD_BUILD_ID##*:}-$(basename "$TEMPLATE_PATH")"
+        aws s3 cp "$TEMPLATE_PATH" "s3://$ARTIFACT_BUCKET/$STAGED_KEY" --only-show-errors
+        aws cloudformation validate-template --template-url "https://$ARTIFACT_BUCKET.s3.$AWS_REGION.amazonaws.com/$STAGED_KEY" >/dev/null
+      - echo "validate-template OK (staged to S3 - template exceeds the 51200-byte inline cap)"
+
+  build:
+    commands:
+      - cfn-lint "$TEMPLATE_PATH"
+      - echo "cfn-lint OK"
+      - checkov -f "$TEMPLATE_PATH" --framework cloudformation --compact --soft-fail || true
+      - ./aws/shared/test-posture-gate.sh
+      - |
+        python3 - "$TEMPLATE_PATH" <<'PY'
+        import fnmatch, json, os, re, subprocess, sys, yaml
+
+        # Resolve the template's short-form intrinsics well enough to walk the policies.
+        class L(yaml.SafeLoader): pass
+        def multi(loader, tag, node):
+            if isinstance(node, yaml.ScalarNode):     v = loader.construct_scalar(node)
+            elif isinstance(node, yaml.SequenceNode): v = loader.construct_sequence(node, deep=True)
+            else:                                     v = loader.construct_mapping(node, deep=True)
+            return {("Fn::" + tag if tag not in ("Ref", "Condition") else tag): v}
+        L.add_multi_constructor("!", multi)
+
+        template_path = sys.argv[1]
+        t = yaml.load(open(template_path), Loader=L)
+
+        NOV = object()
+        def res(n, c):
+            if isinstance(n, dict):
+                if len(n) == 1 and "Fn::If" in n:
+                    k, a, b = n["Fn::If"]
+                    return res(a, c) if c[k] else res(b, c)
+                if len(n) == 1 and n.get("Ref") == "AWS::NoValue":
+                    return NOV
+                return {k: res(v, c) for k, v in n.items() if res(v, c) is not NOV}
+            if isinstance(n, list):
+                return [x for x in (res(i, c) for i in n) if x is not NOV]
+            return n
+
+        # ⚠ ADD EVERY NEW BUCKET HERE. This list drives the condition model, the posture
+        # assertions AND the stack-policy coverage check below - a bucket missing from it
+        # is not "unchecked", it is silently exempt from all three, and the build still
+        # passes green. The template's own Conditions block is cross-checked against the
+        # model built from this list (see `unmodelled`), which catches a forgotten entry
+        # only when the new bucket also introduces a condition NOT named With<B>/
+        # With<B>Policy - so that safety net does not cover the ordinary case.
+        BUCKETS = ["Services", "Artifacts", "Desktop", "Portal", "CfTemplate"]
+
+        # ---- 1. Effective parameter values ---------------------------------------
+        # The keys this pipeline overrides via params.json; everything else falls back to
+        # the Default declared in the template. The five *BucketName entries are derived
+        # below rather than listed, so this set grows with the bucket template.
+        # Fail with the variable name rather than a bare KeyError traceback if the
+        # CodeBuild project is missing an env var it is supposed to supply.
+        _required = ["ENVIRONMENT", "CUSTOMER_PRINCIPALS_PARAM", "CICD_PRINCIPALS_PARAM"]
+        _absent = [v for v in _required if v not in os.environ]
+        if _absent:
+            sys.exit(f"FATAL: CodeBuild env vars not set: {_absent}. These come from the "
+                     f"pipeline stack's ValidateProject EnvironmentVariables - check "
+                     f"the CI/CD pipeline configuration.")
+
+        def principal_list(param_env):
+            """Read a StringList parameter, treating ABSENCE as an empty list.
+
+            Deliberately fetched here rather than declared as a PARAMETER_STORE build
+            variable. Parameter Store cannot hold an empty value at all ("Member must
+            have length greater than or equal to 1"), so the only way to express "no
+            principals of this kind" is for the parameter not to exist - and CodeBuild
+            fails the entire build at PROVISIONING when a PARAMETER_STORE variable
+            points at a missing parameter, before this buildspec ever runs. That turned
+            the supported "leave the list empty" case into an opaque build failure.
+            """
+            name = os.environ[param_env]
+            r = subprocess.run(
+                ["aws", "ssm", "get-parameter", "--name", name,
+                 "--query", "Parameter.Value", "--output", "text"],
+                capture_output=True, text=True)
+            if r.returncode != 0:
+                if "ParameterNotFound" in r.stderr:
+                    print(f"  {name}: absent -> empty list, no statement will be emitted")
+                    return ""
+                sys.exit(f"FATAL: could not read {name}: {r.stderr.strip()}")
+            v = r.stdout.strip()
+            return "" if v == "None" else v
+
+        # ── BUCKET NAMES, AND WHY THEY ARE RENDERED HERE ────────────────────────
+        #
+        # ⚠ THIS STAGE IS THE ONLY PLACE A SECOND ENVIRONMENT CAN SET THEM. The bucket
+        # template names its buckets from parameter Defaults, and params.json below is the
+        # entire template configuration the deploy actions receive - anything absent from it
+        # falls back to those Defaults. Before this block, a pipeline pointed at a second
+        # account inherited the FIRST environment's bucket names and failed at
+        # ExecuteChangeSet with BucketAlreadyExists, because S3 names are global.
+        #
+        # The base name comes from the template's own Default rather than a list repeated
+        # here, so renaming a bucket in platform-buckets.yaml flows through instead of
+        # silently diverging from it.
+        suffix = os.environ.get("BUCKET_NAME_SUFFIX", "")
+        if not re.fullmatch(r"-[a-z0-9]{6,12}", suffix):
+            sys.exit(f"FATAL: BUCKET_NAME_SUFFIX={suffix!r} is not a dash followed by 6-12 "
+                     f"lowercase alphanumerics (e.g. -a1b2c3d4). It is REQUIRED and is "
+                     f"concatenated onto a bucket name, so an illegal value fails as an S3 "
+                     f"naming error rather than as the typo it is.")
+
+        # Checked against the bucket template's OWN AllowedPattern, read from the template,
+        # so the two can never disagree about what a legal name is.
+        _name_rx = t["Parameters"]["ServicesBucketName"]["AllowedPattern"]
+        BUCKET_NAMES = {}
+        for b in ["Services", "Artifacts", "Desktop", "Portal", "CfTemplate"]:
+            key = f"{b}BucketName"
+            base = t["Parameters"][key]["Default"]
+            # ⚠ THE TEMPLATE APPENDS BucketNameSuffix ITSELF (BucketName: !Sub
+            # "${XBucketName}${BucketNameSuffix}"), so we pass the BARE BASE here and let it be
+            # appended exactly once. Appending it here too would double it
+            # (praimana-services-a1b2c3d4-a1b2c3d4) and fail s3:CreateBucket. We still compute
+            # the full name below only to VALIDATE length and pattern.
+            full = f"{base}{suffix}"
+            # 63 is the S3 ceiling. Caught here, naming the bucket, rather than at
+            # CreateChangeSet where the same mistake is an opaque parameter error.
+            if len(full) > 63:
+                sys.exit(f"FATAL: {key}={full!r} is {len(full)} chars; S3's limit is 63. "
+                         f"Shorten BUCKET_NAME_SUFFIX ({suffix!r}) or the base name.")
+            if not re.fullmatch(_name_rx, full):
+                sys.exit(f"FATAL: {key}={full!r} does not match the template's own "
+                         f"AllowedPattern {_name_rx!r}.")
+            BUCKET_NAMES[key] = base
+
+        OVERRIDES = {
+            "CustomerPrincipals":     principal_list("CUSTOMER_PRINCIPALS_PARAM"),
+            "CicdPrincipals":         principal_list("CICD_PRINCIPALS_PARAM"),
+            "EnableDeleteProtection": os.environ.get("ENABLE_DELETE_PROTECTION", "true"),
+            "CicdCanDelete":          os.environ.get("CICD_CAN_DELETE", "false"),
+            # Tag values, forwarded from the pipeline stack's own parameters so the buckets
+            # and the CI/CD resources that manage them carry matching tags. Environment has
+            # no Default in the template, so this override is REQUIRED - fail loudly here
+            # rather than at CreateChangeSet with a parameter-validation error.
+            "Environment":            os.environ["ENVIRONMENT"],
+            "ApplicationName":        os.environ.get("APPLICATION_NAME", "Praimana"),
+            "AutoDelete":             os.environ.get("AUTO_DELETE", "never"),
+            # ⚠ REQUIRED in params.json: the access-log bucket resource builds its own name as
+            # ${AccessLogBucketName}${BucketNameSuffix} inside the template, so the suffix must
+            # reach the template as a parameter (the 5 main names are pre-rendered above, but
+            # this one is not). BucketNameSuffix has no Default in the template, so omitting it
+            # here would fail at CreateChangeSet.
+            "BucketNameSuffix":       suffix,
+            **BUCKET_NAMES,
+        }
+        def param(name):
+            if name in OVERRIDES:
+                return OVERRIDES[name]
+            return t["Parameters"][name].get("Default", "")
+
+        # ---- 2. Conditions, mirroring the template's Conditions block -------------
+        cond = {
+            "DeleteProtection": param("EnableDeleteProtection") == "true",
+            "HasCustomers":     param("CustomerPrincipals") != "",
+            "HasCicd":          param("CicdPrincipals") != "",
+            "HasCicdDelete":    param("CicdPrincipals") != ""
+                                and param("CicdCanDelete") == "true",
+        }
+        for b in BUCKETS:
+            mode = param(f"{b}BucketMode")
+            cond[f"With{b}"]       = mode != "false"
+            cond[f"With{b}Policy"] = mode == "true"
+
+        # A condition in the template that we have not modelled would otherwise blow up
+        # as a bare KeyError deep inside res(). Fail here, with the name.
+        unmodelled = set(t.get("Conditions", {})) - set(cond)
+        if unmodelled:
+            sys.exit(f"FATAL: template conditions not modelled by this buildspec: "
+                     f"{sorted(unmodelled)}")
+
+        print("effective conditions:")
+        for k in sorted(cond):
+            print(f"  {k:22} {cond[k]}")
+
+        # ---- 3. Posture assertions, against what will actually deploy -------------
+        fail, warn = [], []
+
+        # ---- Semantic action matching ---------------------------------------------
+        # ⚠ LITERAL MEMBERSHIP IS NOT A CHECK, AND THIS GATE IS THE NAMED CONTROL FOR THE
+        # DRIFT THIS TEMPLATE PUTS IN SCOPE. platform-buckets.yaml deliberately does NOT deny
+        # s3:PutBucketPolicy ("so the guard can always be lifted"), which means live
+        # bucket-policy drift is expected and these assertions are what should catch it.
+        #
+        # `"s3:DeleteObjectVersion" in actions` catches exactly one spelling. A policy granting
+        # s3:Delete*, s3:D*, s3:*Version or s3:* grants the same thing and passed silently. IAM
+        # matches action patterns with * and ?, so the gate has to match the same way - in the
+        # direction that matters: the GRANT is the pattern, the forbidden action is the string
+        # being tested against it.
+        # ⚠ ALLOW ONLY, and this is not a detail. Once matching is semantic, "s3:*" in the
+        # DenyInsecureTransport statement MATCHES s3:DeleteObjectVersion - so testing every
+        # statement would fail the build on the correct template, for the statement that is
+        # doing the protecting. A Deny on a broad pattern is the good case. (Caught by running
+        # the gate against the real template before shipping the change.)
+        FORBIDDEN_ACTIONS = ["s3:DeleteObjectVersion"]
+
+        def granted(stmt, actions, forbidden):
+            if stmt["Effect"] != "Allow":
+                return []
+            return [a for a in actions if fnmatch.fnmatchcase(forbidden, a)]
+
+        def wildcard_allows(stmt, actions):
+            # Any Allow whose action pattern contains a wildcard. Stricter than the old
+            # `"s3:*" in actions`, and verified against the current template first: it has ten
+            # distinct Allow actions and not one of them is a pattern, so a wildcard here is
+            # always someone widening a grant rather than an existing idiom.
+            if stmt["Effect"] != "Allow":
+                return []
+            return [a for a in actions if "*" in a or "?" in a]
+
+        # ── ⚠ AND THE SAME QUESTION ABOUT THE PRINCIPAL, WHICH THIS GATE NEVER ASKED ──────────
+        #
+        # A SECURITY FINDING: bucket-policy Principal lists were unconstrained and unchecked by
+        # the posture gate, so an SSM parameter value could grant any account write access to
+        # the Lambda artifact prefix.
+        #
+        # This gate exists BECAUSE the template deliberately does not deny s3:PutBucketPolicy
+        # ("live bucket-policy drift is expected and these assertions are what should catch
+        # it"). It inspected Effect, Action, Sid, versioning, deletion policy and public-access
+        # blocks - and never WHO a statement grants to. An Allow with the right actions and a
+        # Principal of "*" passed every assertion above.
+        #
+        # ⚠ TWO CONTROLS FOR ONE VALUE, ON PURPOSE. The AllowedPattern now on
+        # CustomerPrincipals/CicdPrincipals refuses a wildcard at the parameter, and this refuses
+        # it in the rendered statement. They are not redundant: the pattern is bypassed by
+        # anything that edits the template, and this is bypassed by a live PutBucketPolicy the
+        # gate never sees. Each closes the other's gap.
+        #
+        # Deny statements are exempt: a Deny on Principal "*" is how DenyInsecureTransport and
+        # DenyBucketDeletion are supposed to be written, and testing them would fail the build on
+        # the correct template - the same trap FORBIDDEN_ACTIONS documents above.
+        # ⚠ `res()` RESOLVES CONDITIONS, NOT Ref, so a Principal in this template arrives here as
+        # {'Ref': 'CicdPrincipals'} rather than as ARNs. The first version of this check treated
+        # that as unreadable and failed the PRISTINE template - caught by test-posture-gate.sh,
+        # which is the whole reason that harness exists. So the parameter is resolved through the
+        # same `param()` the conditions and params.json use: the gate then checks the values the
+        # deploy will actually send, which is the only version of this check worth having.
+        def principal_entries(principal):
+            if isinstance(principal, str):
+                return [principal]
+            if not isinstance(principal, dict):
+                return [repr(principal)]
+            out = []
+            for key, value in principal.items():
+                if key == "Ref":
+                    # A CommaDelimitedList parameter: one entry per comma.
+                    out.extend(x.strip() for x in str(param(value)).split(",") if x.strip())
+                    continue
+                # Service/Federated/CanonicalUser are not account ARNs and are not what this
+                # check is about; surfaced rather than skipped, because nothing in these five
+                # bucket policies should have one and a new one deserves a look.
+                if key != "AWS":
+                    out.append(f"{key}={value}")
+                    continue
+                values = value if isinstance(value, list) else [value]
+                for v in values:
+                    out.extend(principal_entries(v) if not isinstance(v, str) else [v])
+            return out
+
+        def wildcard_principals(stmt):
+            if stmt["Effect"] != "Allow":
+                return []
+            principal = stmt.get("Principal")
+            if principal is None:
+                return []
+            bad = []
+            for entry in principal_entries(principal):
+                if not isinstance(entry, str):
+                    # Still unreadable after resolution: report rather than guess. A check that
+                    # silently passes on a shape it cannot parse is worse than no check.
+                    bad.append(f"unrendered: {entry!r}")
+                elif "*" in entry or "?" in entry:
+                    bad.append(entry)
+                elif not re.fullmatch(r"arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/.+)", entry):
+                    bad.append(f"not an account-root or role ARN: {entry}")
+            return bad
+
+        # DenyBucketDeletion only exists when delete protection is on. Not an assertion
+        # failure - false is the documented first-run value - but it must be loud.
+        required_sids = ["DenyInsecureTransport"]
+        if cond["DeleteProtection"]:
+            required_sids.append("DenyBucketDeletion")
+        else:
+            warn.append("EnableDeleteProtection=false: no DenyBucketDeletion guard will "
+                        "be deployed. Valid for a FIRST run only - set it back to true "
+                        "and re-run immediately after.")
+
+        for b in BUCKETS:
+            if not cond[f"With{b}"]:
+                print(f"  {b}: mode=false, not in this stack - skipped")
+                continue
+
+            bucket = t["Resources"][f"{b}Bucket"]
+            props = bucket["Properties"]
+            if props.get("VersioningConfiguration", {}).get("Status") != "Enabled":
+                fail.append(f"{b}: versioning not Enabled")
+            if bucket.get("DeletionPolicy") != "Retain" or bucket.get("UpdateReplacePolicy") != "Retain":
+                fail.append(f"{b}: DeletionPolicy/UpdateReplacePolicy must both be Retain")
+            pab = props.get("PublicAccessBlockConfiguration", {})
+            if not (len(pab) == 4 and all(pab.values())):
+                fail.append(f"{b}: all four public-access blocks must be true")
+
+            if not cond[f"With{b}Policy"]:
+                # mode=import: the policy is deliberately withheld from the change set.
+                warn.append(f"{b}: mode=import, bucket POLICY withheld - no TLS deny, no "
+                            f"delete guard and no grants until the mode is flipped to true")
+                continue
+
+            stmts = res(t["Resources"][f"{b}BucketPolicy"]["Properties"]["PolicyDocument"], cond)["Statement"]
+            sids = [s["Sid"] for s in stmts]
+            if len(sids) != len(set(sids)):
+                fail.append(f"{b}: duplicate Sid")
+            for required in required_sids:
+                if required not in sids:
+                    fail.append(f"{b}: missing {required}")
+            for s in stmts:
+                actions = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+                for forbidden in FORBIDDEN_ACTIONS:
+                    via = granted(s, actions, forbidden)
+                    if via:
+                        fail.append(f"{b}/{s['Sid']}: grants {forbidden} via {via}")
+                wild = wildcard_allows(s, actions)
+                if wild:
+                    fail.append(f"{b}/{s['Sid']}: wildcard action in an Allow: {wild}")
+                bad_principals = wildcard_principals(s)
+                if bad_principals:
+                    fail.append(f"{b}/{s['Sid']}: unacceptable Principal in an Allow: "
+                                f"{bad_principals}")
+            # The desktop bucket is a write-only CI/CD drop box.
+            if b == "Desktop" and any(x.startswith("Customer") for x in sids):
+                fail.append("Desktop: must not grant readers")
+            print(f"  {b}: policy OK ({', '.join(sids)})")
+
+        # ---- 4. Companion stack policy -------------------------------------------
+        # Applied by the VERIFY stage via SetStackPolicy, NOT through the change set:
+        # CreateChangeSet/ExecuteChangeSet accept no StackPolicyBody (verified against
+        # the CloudFormation API model - only CreateStack/UpdateStack/SetStackPolicy
+        # do), so a "StackPolicy" key in this template configuration is silently
+        # dropped. Asserted here so a missing or narrowed policy fails BEFORE deploy.
+        sp_path = os.path.join(os.path.dirname(template_path) or ".", "stack-policy.json")
+        if not os.path.exists(sp_path):
+            fail.append(f"stack policy missing: {sp_path}")
+        else:
+            try:
+                sp = json.load(open(sp_path))
+            except json.JSONDecodeError as e:
+                sp = None
+                fail.append(f"stack policy is not valid JSON: {e}")
+            if sp is not None:
+                guarded = set()
+                for s in sp.get("Statement", []):
+                    if s.get("Effect") != "Deny":
+                        continue
+                    acts = s.get("Action", [])
+                    acts = acts if isinstance(acts, list) else [acts]
+                    if not {"Update:Replace", "Update:Delete"} <= set(acts):
+                        continue
+                    rs = s.get("Resource", [])
+                    guarded |= set(rs if isinstance(rs, list) else [rs])
+                for b in BUCKETS:
+                    if not cond[f"With{b}"]:
+                        continue
+                    want = f"LogicalResourceId/{b}Bucket"
+                    if want not in guarded:
+                        fail.append(f"stack policy does not deny Replace/Delete on {want}")
+                    # ⚠ THE POLICY RESOURCE NEEDS THE SAME GUARD AS THE BUCKET. Protecting
+                    # only <B>Bucket left <B>BucketPolicy replaceable by an ordinary stack
+                    # update, and the bucket policy is where DenyInsecureTransport and
+                    # DenyBucketDeletion live - so the bucket survived while the guards on it
+                    # did not. The bucket is Retain, so dropping its policy leaves a live,
+                    # unguarded bucket rather than an obvious failure.
+                    if not cond[f"With{b}Policy"]:
+                        continue
+                    want_policy = f"LogicalResourceId/{b}BucketPolicy"
+                    if want_policy not in guarded:
+                        fail.append(f"stack policy does not deny Replace/Delete on {want_policy}")
+                if not fail:
+                    print(f"  stack policy OK ({len(guarded)} guarded resources)")
+
+        # ---- 5. Report ------------------------------------------------------------
+        for w in warn:
+            print(f"\n!! WARNING: {w}")
+        if fail:
+            print("\nASSERTIONS FAILED:")
+            for f in fail:
+                print("  -", f)
+            sys.exit(1)
+        checked = ["versioning", "Retain", "PAB", "TLS deny",
+                   "delete guard" if cond["DeleteProtection"] else "delete guard OFF (warned)",
+                   "no version-delete grant", "no wildcard Allow",
+                   # ⚠ ADDED WITH THE CHECK, AND IT WAS MISSED FIRST TIME. The Principal assertion
+                   # went in without a label here, so the gate ran it and then printed a summary
+                   # that did not mention it — a coverage line that under-reports is the same
+                   # defect as a coverage line that over-reports, in the direction nobody notices.
+                   # Verified in a real run: the check executed and passed, and this line still
+                   # said only nine things had been asserted.
+                   "no wildcard or non-ARN Principal in an Allow",
+                   "desktop stays write-only", "stack policy covers managed buckets"]
+        print("\nposture assertions OK: " + ", ".join(checked))
+
+        # ---- 6. Render the CloudFormation template configuration ------------------
+        # Principal lists come from Parameter Store, so no account id is ever committed
+        # to this repo. NOTE: no "StackPolicy" key - see section 4. It would be accepted
+        # here and silently ignored, which is worse than not writing it.
+        with open("params.json", "w") as fh:
+            json.dump({
+                # ⚠ THE *BucketName KEYS ARE THE LOAD-BEARING ADDITION. Omitting them
+                # means the bucket names come from the
+                # template's Defaults, so every environment competes for the same GLOBAL
+                # S3 names. Built from OVERRIDES rather than repeated, so a bucket added
+                # to BUCKETS above cannot be left out of the deploy.
+                "Parameters": {k: OVERRIDES[k] for k in (
+                    "CustomerPrincipals", "CicdPrincipals",
+                    "EnableDeleteProtection", "CicdCanDelete",
+                    "Environment", "ApplicationName", "AutoDelete",
+                    "BucketNameSuffix",
+                    *sorted(BUCKET_NAMES))},
+                # Stack-level tags, which CloudFormation also propagates to taggable
+                # resources. The buckets additionally carry these as resource-level Tags
+                # from the template itself, so the auto-delete guard does not depend on
+                # anyone remembering to pass stack tags.
+                "Tags": {
+                    "ApplicationName": OVERRIDES["ApplicationName"],
+                    "Environment":     OVERRIDES["Environment"],
+                    "auto-delete":     OVERRIDES["AutoDelete"],
+                    "managed-by":      "praimana-infra-shared-pipeline",
+                },
+            }, fh, indent=2)
+        print("wrote params.json")
+        PY
+      - python3 -c "import json;d=json.load(open('params.json'))['Parameters'];print({k:v for k,v in d.items() if 'Principals' not in k})"
+
+artifacts:
+  files:
+    - params.json

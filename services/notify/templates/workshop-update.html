@@ -1,0 +1,43 @@
+<p style="margin:0 0 6px;color:#6366f1;font-size:12px;text-transform:uppercase;letter-spacing:0.8px;font-weight:700;">Workshop update</p>
+<h1 style="margin:0 0 6px;font-size:22px;line-height:1.3;color:#111827;font-weight:700;">{{headline}}</h1>
+<p style="margin:0 0 20px;color:#6b7280;font-size:14px;line-height:1.65;">
+  {{#workshopName}}<strong>{{workshopName}}</strong>{{/workshopName}}{{#recipientName}} &middot; Hi {{recipientName}}{{/recipientName}}
+</p>
+
+<p style="margin:0 0 22px;color:#374151;font-size:14px;line-height:1.65;">{{body}}</p>
+
+{{#hasDetails}}
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 24px;background:#f8f8fc;border:1px solid #ecebf6;border-radius:12px;">
+  <tr>
+    <td style="padding:16px 18px;">
+      {{#details}}
+      <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="margin:0 0 10px;">
+        <tr>
+          <td style="color:#9ca3af;font-size:11px;text-transform:uppercase;letter-spacing:0.6px;font-weight:600;padding:0 0 2px;">{{label}}</td>
+        </tr>
+        <tr>
+          <td style="color:#1f2937;font-size:14px;font-weight:600;">{{value}}</td>
+        </tr>
+      </table>
+      {{/details}}
+    </td>
+  </tr>
+</table>
+{{/hasDetails}}
+
+{{#actionUrl}}
+<table role="presentation" cellpadding="0" cellspacing="0" style="margin:0 0 28px;">
+  <tr>
+    <!-- bgcolor as well as the style: the anchor paints white text, so a client that
+         ignores the style attribute must still have a colour behind it. -->
+    <td bgcolor="#4f46e5" style="border-radius:10px;background:#4f46e5;">
+      <a href="{{actionUrl}}" style="display:inline-block;padding:13px 26px;font-size:14px;font-weight:600;color:#ffffff;text-decoration:none;border-radius:10px;">{{actionLabel}}</a> <!-- nosemgrep: var-in-href,template-href-var -->
+    </td>
+  </tr>
+</table>
+{{/actionUrl}}
+
+<hr style="border:none;border-top:1px solid #f0f1f4;margin:0 0 16px;" />
+<p style="margin:0 0 24px;color:#9ca3af;font-size:12px;line-height:1.6;">
+  You're receiving this because you're part of {{#workshopName}}{{workshopName}}{{/workshopName}}{{^workshopName}}this workshop{{/workshopName}}.
+</p>

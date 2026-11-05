@@ -1,0 +1,226 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.12
+    commands:
+      - pip install --quiet cfn-lint==1.58.0 pyyaml==6.0.3
+
+  pre_build:
+    commands:
+      - |
+        set -e
+        TEMPLATES="$(ls aws/app/platform*.yaml | sort | tr '\n' ' ')"
+        COUNT=$(echo $TEMPLATES | wc -w | tr -d '[:space:]')
+        EXPECT="${EXPECT_TEMPLATE_COUNT:-9}"
+        echo "templates ($COUNT): $TEMPLATES"
+        [ "$COUNT" = "$EXPECT" ] || { echo "FATAL: expected $EXPECT templates, found $COUNT. Set EXPECT_TEMPLATE_COUNT if a tier was added or removed on purpose."; exit 1; }
+        echo "$TEMPLATES" | grep -q "aws/app/platform.yaml" || { echo "FATAL: the platform.yaml master is missing"; exit 1; }
+        COMMIT="${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}"
+        SHORT="${COMMIT:0:12}"
+        { echo "TEMPLATES=\"$TEMPLATES\""; echo "COMMIT=$COMMIT"; echo "SHORT=$SHORT"; } > /tmp/build.env
+        echo "commit $SHORT -> s3://$CF_TEMPLATE_BUCKET/$CF_TEMPLATE_PREFIX"
+
+      - |
+        set -e
+        . /tmp/build.env
+        for t in $TEMPLATES; do
+          bytes=$(wc -c < "$t" | tr -d '[:space:]')
+          printf '  %-42s %8s bytes\n' "$t" "$bytes"
+          if [ "$bytes" -ge 1048576 ]; then
+            echo "FATAL: $t exceeds CloudFormation's 1 MB S3 template limit."
+            exit 1
+          fi
+        done
+
+  build:
+    commands:
+      - |
+        set -e
+        . /tmp/build.env
+        cfn-lint $TEMPLATES
+      - echo "cfn-lint OK"
+
+      - |
+        . /tmp/build.env
+        python3 - $TEMPLATES <<'PY'
+        import sys, yaml
+
+        class L(yaml.SafeLoader): pass
+        def multi(loader, tag, node):
+            if isinstance(node, yaml.ScalarNode):     v = loader.construct_scalar(node)
+            elif isinstance(node, yaml.SequenceNode): v = loader.construct_sequence(node, deep=True)
+            else:                                     v = loader.construct_mapping(node, deep=True)
+            return {tag: v}
+        L.add_multi_constructor("!", multi)
+
+        VERSIONING_EXEMPT = {
+            "DocsAccessLogBucket":   "S3 log delivery; log objects are written once, never rewritten",
+            "CanaryArtifactsBucket": "run artifacts behind a 30-day expiry; versioning would defeat it",
+        }
+
+        fail, total = [], 0
+        for path in sys.argv[1:]:
+            res = yaml.load(open(path), Loader=L).get("Resources", {})
+            buckets = {k: v for k, v in res.items() if v.get("Type") == "AWS::S3::Bucket"}
+            policies = {k: v for k, v in res.items() if v.get("Type") == "AWS::S3::BucketPolicy"}
+            policy_for = {}
+            for name, pol in policies.items():
+                ref = pol.get("Properties", {}).get("Bucket")
+                target = ref.get("Ref") if isinstance(ref, dict) else ref
+                if isinstance(target, str):
+                    policy_for[target] = name
+
+            for name, b in sorted(buckets.items()):
+                total += 1
+                where = f"{path.split('/')[-1]}:{name}"
+                props = b.get("Properties", {})
+                if props.get("VersioningConfiguration", {}).get("Status") != "Enabled":
+                    if name in VERSIONING_EXEMPT:
+                        print(f"  {where:46} versioning exempt - {VERSIONING_EXEMPT[name]}")
+                    else:
+                        fail.append(f"{where}: versioning not Enabled and not in VERSIONING_EXEMPT")
+                pab = props.get("PublicAccessBlockConfiguration", {})
+                if not (len(pab) == 4 and all(pab.values())):
+                    fail.append(f"{where}: all four public-access blocks must be true, got {pab}")
+                if not props.get("BucketEncryption"):
+                    fail.append(f"{where}: no BucketEncryption")
+                pol_name = policy_for.get(name)
+                if not pol_name:
+                    fail.append(f"{where}: no AWS::S3::BucketPolicy (needs DenyInsecureTransport)")
+                    continue
+                stmts = policies[pol_name]["Properties"]["PolicyDocument"]["Statement"]
+                sids = [s.get("Sid") for s in stmts]
+                if "DenyInsecureTransport" not in sids:
+                    fail.append(f"{where}: {pol_name} has no DenyInsecureTransport statement")
+                for st in stmts:
+                    if st.get("Effect") != "Allow":
+                        continue
+                    acts = st.get("Action", [])
+                    acts = acts if isinstance(acts, list) else [acts]
+                    wild = [a for a in acts if isinstance(a, str) and ("*" in a or "?" in a)]
+                    if wild:
+                        fail.append(f"{where}/{st.get('Sid')}: wildcard action in an Allow: {wild}")
+                print(f"  {where:46} OK  ({pol_name})")
+
+        if not total:
+            sys.exit("FATAL: no S3 buckets found in any template - wrong files?")
+        if fail:
+            print("\nAPP BUCKET POSTURE FAILED:")
+            for f in fail:
+                print("  -", f)
+            sys.exit(1)
+        print(f"\napp bucket posture OK ({total} buckets)")
+        PY
+
+      - |
+        set -e
+        . /tmp/build.env
+        python3 - $TEMPLATES <<'PY' > /tmp/facts.json
+        import json, sys, yaml
+        class L(yaml.SafeLoader): pass
+        def multi(loader, tag, node):
+            if isinstance(node, yaml.ScalarNode):     v = loader.construct_scalar(node)
+            elif isinstance(node, yaml.SequenceNode): v = loader.construct_sequence(node, deep=True)
+            else:                                     v = loader.construct_mapping(node, deep=True)
+            return {tag: v}
+        L.add_multi_constructor("!", multi)
+        facts = {}
+        for path in sys.argv[1:]:
+            t = yaml.load(open(path), Loader=L)
+            p = t.get("Parameters", {})
+            entry = {
+                "resources":  len(t.get("Resources", {})),
+                "parameters": len(p),
+                "outputs":    len(t.get("Outputs", {})),
+                "transform":  t.get("Transform"),
+            }
+            for key in ("ReleaseVersion", "PortalReleaseVersion"):
+                if key in p:
+                    entry[key] = p[key].get("Default")
+            if not entry["resources"]:
+                sys.exit(f"FATAL: {path} parsed with zero resources - wrong file?")
+            facts[path.split("/")[-1]] = entry
+        json.dump(facts, sys.stdout, indent=2)
+        PY
+      - cat /tmp/facts.json
+
+  post_build:
+    commands:
+      - |
+        if [ "${CODEBUILD_BUILD_SUCCEEDING:-1}" != "1" ]; then
+          echo "REFUSING TO PUBLISH: an earlier phase failed. Nothing uploaded."
+          exit 1
+        fi
+
+      - |
+        set -e
+        . /tmp/build.env
+        for t in $TEMPLATES; do
+          base="$(basename "$t" .yaml)"
+          key="${CF_TEMPLATE_PREFIX}${base}-${SHORT}.yaml"
+          bytes=$(wc -c < "$t" | tr -d '[:space:]')
+          aws s3 cp "$t" "s3://$CF_TEMPLATE_BUCKET/$key" --content-type "text/yaml" \
+            --metadata "commit=$COMMIT,build=${CODEBUILD_BUILD_NUMBER:-unknown},bytes=$bytes"
+          remote=$(aws s3api head-object --bucket "$CF_TEMPLATE_BUCKET" --key "$key" \
+                     --query ContentLength --output text)
+          [ "$bytes" = "$remote" ] || { echo "FATAL: size differs for $key"; exit 1; }
+          echo "published immutable s3://$CF_TEMPLATE_BUCKET/$key"
+        done
+
+      - |
+        set -e
+        . /tmp/build.env
+        for t in $TEMPLATES; do
+          base="$(basename "$t" .yaml)"
+          url="https://${CF_TEMPLATE_BUCKET}.s3.${AWS_REGION}.amazonaws.com/${CF_TEMPLATE_PREFIX}${base}-${SHORT}.yaml"
+          aws cloudformation validate-template --template-url "$url" > /dev/null \
+            || { echo "FATAL: CloudFormation rejected $url."
+                 echo "No pointer has been moved - consumers still get the last good templates."
+                 exit 1; }
+          echo "validate-template OK  $base"
+        done
+
+      - |
+        set -e
+        . /tmp/build.env
+        for t in $TEMPLATES; do
+          base="$(basename "$t" .yaml)"
+          key="${CF_TEMPLATE_PREFIX}${base}-${SHORT}.yaml"
+          pointer="${CF_TEMPLATE_PREFIX}${base}.yaml"
+          aws s3 cp "s3://$CF_TEMPLATE_BUCKET/$key" "s3://$CF_TEMPLATE_BUCKET/$pointer" \
+            --content-type "text/yaml" --metadata-directive REPLACE \
+            --metadata "commit=$COMMIT,build=${CODEBUILD_BUILD_NUMBER:-unknown}"
+          echo "updated pointer s3://$CF_TEMPLATE_BUCKET/$pointer"
+        done
+
+      - |
+        set -e
+        . /tmp/build.env
+        python3 - <<'PY' > /tmp/manifest.json
+        import json, os
+        bucket, prefix = os.environ["CF_TEMPLATE_BUCKET"], os.environ["CF_TEMPLATE_PREFIX"]
+        region = os.environ.get("AWS_REGION", "us-east-1")
+        print(json.dumps({
+            "app": "praimana",
+            "component": "cloudformation-templates",
+            "commit": os.environ["COMMIT"],
+            "buildNumber": os.environ.get("CODEBUILD_BUILD_NUMBER"),
+            "masterTemplateUrl": f"https://{bucket}.s3.{region}.amazonaws.com/{prefix}platform.yaml",
+            "region": region,
+            "sameRegionOnly": "CloudFormation rejects a --template-url bucket in another region",
+            "templates": json.load(open("/tmp/facts.json")),
+        }, indent=2))
+        PY
+        cat /tmp/manifest.json
+        aws s3 cp /tmp/manifest.json "s3://$CF_TEMPLATE_BUCKET/${CF_TEMPLATE_PREFIX}manifest.json" \
+          --content-type "application/json" \
+          --metadata "commit=$COMMIT,build=${CODEBUILD_BUILD_NUMBER:-unknown}"
+
+      - |
+        echo ""
+        echo "Deploy the platform from the published master (see infra/SETUP.md, Phase 2):"
+        echo "  aws cloudformation deploy --template-file aws/app/platform.yaml ... \\"
+        echo "    --parameter-overrides TemplateBucket=$CF_TEMPLATE_BUCKET TemplatePrefix=$CF_TEMPLATE_PREFIX ..."
+        echo "The stack must be created in ${AWS_REGION} - a cross-region template URL is refused."

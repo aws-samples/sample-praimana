@@ -1,0 +1,4 @@
+.kiro/*
+# Local deployment config and state (account-specific; never commit)
+infra/scripts/deploy-config.json
+infra/scripts/.state/

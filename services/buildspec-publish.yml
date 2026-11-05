@@ -1,0 +1,325 @@
+# Build every Lambda service and publish its zip to the Shared-account `services` bucket.
+#
+# Driven by the services-publish CodeBuild project in the deployment pipeline.
+# Env vars it supplies:
+#   SERVICES_BUCKET  - destination bucket (SHARED account)
+#   LAMBDA_PREFIX    - key prefix, must match what the bucket policy grants (lambda/)
+#
+# ⚠ THE KEY LAYOUT IS NOT CHOSEN HERE. It is fixed by the app-account stack, which reads
+#
+#     Key: !Sub "lambda/v${ReleaseVersion}/<svc>/<svc>.zip"
+#
+# for all fifteen functions, with ReleaseVersion constrained to ^[0-9]+\.[0-9]+\.[0-9]+$ -
+# BARE SEMVER, exactly package.json's own version. The leading `v` in the KEY is a literal in
+# that template, so it is this file's job to put one in the key too, and NOT the deployer's job
+# to type one. Previously the `v` was part of the parameter instead, which meant the API
+# tier and the portal tier took one release under two spellings (v0.6.13 against 0.6.13) and
+# a deploy script had to know which tier wanted which.
+#
+# ⚠ A PUBLISHED RELEASE IS IMMUTABLE, AND THAT IS ENFORCED BELOW. Unlike the portal
+# publisher, the commit CANNOT go in the key - the consuming template names the path exactly,
+# so there is nowhere to put it. Overwriting a release therefore changes what an existing
+# stack fetches on its next update, with no signal that anything moved.
+#
+# The app template documents this failure mode from experience: its ReleaseVersion default
+# once drifted four versions behind while every deploy succeeded, because the old artifacts
+# were still in the bucket. A stale version is not a broken deploy, it is a working deploy of
+# the wrong code. Mutating a version would make that worse - the same version would mean
+# different code over time.
+#
+# So: to publish, bump "version" in the root package.json. There is no override flag.
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+    commands:
+      - corepack enable
+      - corepack prepare "$(node -p "require('./package.json').packageManager")" --activate
+      - pnpm --version
+
+  pre_build:
+    commands:
+      # ---- version, and the release prefix it implies -------------------------------
+      - |
+        RAW="$(node -p "require('./package.json').version")"
+        [ -n "$RAW" ] || { echo "FATAL: no version in the root package.json"; exit 1; }
+        # ⚠ VALIDATE THE BARE VERSION, because that is what a deployer passes as
+        # ReleaseVersion. Fail here rather than at CreateChangeSet in the app account, where
+        # the same mistake surfaces as an opaque parameter-validation error.
+        echo "$RAW" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || {
+          echo "FATAL: '$RAW' does not match the app stack's ReleaseVersion pattern"
+          echo "       ^[0-9]+\\.[0-9]+\\.[0-9]+\$  - set package.json version to e.g. 1.0.0"
+          exit 1; }
+        # The `v` belongs to the KEY, not to the version. See the header.
+        VERSION="v$RAW"
+        COMMIT="${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}"
+        RELEASE_PREFIX="${LAMBDA_PREFIX}${VERSION}/"
+        { echo "VERSION=$VERSION"; echo "RAW=$RAW"; echo "COMMIT=$COMMIT"
+          echo "RELEASE_PREFIX=$RELEASE_PREFIX"; } > /tmp/build.env
+        echo "release $VERSION  commit ${COMMIT:0:12}"
+        echo "destination s3://$SERVICES_BUCKET/$RELEASE_PREFIX"
+
+      # ---- the service list comes from the workspace, not a hardcoded list ----------
+      # An allowlist here would silently skip a service added in a later commit, and the app
+      # stack would then deploy a stale zip for it - or fail to find one at all.
+      - |
+        node -e '
+          const fs = require("fs");
+          const y = fs.readFileSync("pnpm-workspace.yaml", "utf8");
+          // Deliberately a line scan rather than a YAML parser: this runs before any
+          // dependency is installed, so nothing is available to require.
+          const pkgs = y.split("\n")
+            .map(l => l.match(/^\s*-\s*"?([A-Za-z0-9._-]+)"?\s*$/))
+            .filter(Boolean).map(m => m[1]);
+          // shared and service-shared are LIBRARIES - bundled into each handler by esbuild,
+          // never deployed as functions of their own.
+          const svcs = pkgs.filter(p => p !== "shared" && p !== "service-shared");
+          if (!svcs.length) { console.error("FATAL: no services found in pnpm-workspace.yaml"); process.exit(1); }
+          fs.writeFileSync("/tmp/services.txt", svcs.join("\n") + "\n");
+          console.log("services (" + svcs.length + "): " + svcs.join(", "));
+        '
+
+      # ---- refuse to disturb a release that already exists -------------------------
+      # Checked BEFORE anything is built or uploaded, so a refusal leaves the bucket
+      # untouched rather than half-written.
+      #
+      # Republishing the SAME commit is allowed: that is a resumption, not a mutation, and
+      # blocking it would strand a release whose upload died halfway with no way forward but
+      # an artificial version bump.
+      - |
+        . /tmp/build.env
+        existing=$(aws s3api list-objects-v2 --bucket "$SERVICES_BUCKET" \
+                     --prefix "$RELEASE_PREFIX" --max-items 1 \
+                     --query 'length(Contents)' --output text 2>/dev/null || echo 0)
+        if [ "$existing" = "None" ] || [ -z "$existing" ]; then existing=0; fi
+        if [ "$existing" -gt 0 ]; then
+          prev=$(aws s3 cp "s3://$SERVICES_BUCKET/${RELEASE_PREFIX}manifest.json" - 2>/dev/null \
+                 | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{console.log(JSON.parse(s).commit||"")}catch{console.log("")}})' 2>/dev/null || true)
+          if [ -n "$prev" ] && [ "$prev" = "$COMMIT" ]; then
+            echo "note: $VERSION already published from THIS commit - republishing identically"
+          elif [ -n "$prev" ]; then
+            echo "=============================================================="
+            echo "FATAL: release $VERSION is already published, from a DIFFERENT commit."
+            echo "  published: ${prev:0:12}"
+            echo "  this build: ${COMMIT:0:12}"
+            echo ""
+            echo "A published release is immutable: the app stack reads"
+            echo "  lambda/$VERSION/<svc>/<svc>.zip"
+            echo "with no commit in the path, so overwriting would change what an"
+            echo "existing stack fetches on its next update with no signal at all."
+            echo ""
+            echo "Bump \"version\" in the root package.json and push."
+            echo "=============================================================="
+            exit 1
+          else
+            echo "!! WARNING: objects exist under $RELEASE_PREFIX but no manifest - a previous"
+            echo "   publish did not complete. Treating this as a resumption."
+          fi
+        else
+          echo "release $VERSION not yet published - proceeding"
+        fi
+
+  build:
+    commands:
+      - pnpm install --frozen-lockfile
+      # ─── SCA: DEPENDENCY VULNERABILITY GATE ───────────────────────────────────────────────
+      # ⚠ THIS CLOSED A REAL GAP RATHER THAN A THEORETICAL ONE. Before this
+      # existed, NOTHING in the pipeline looked at dependencies. The first-party code scanners
+      # (SAST) scan only first-party material - semgrep over our TypeScript, cfn_nag/checkov over
+      # our CloudFormation, gitleaks over our files. The ~2,670 packages resolved across the three
+      # lockfiles were unchecked, and the first run of this scan found 53 known-vulnerable
+      # packages, every one with a fix already published - including two CRITICAL in `next`.
+      #
+      # Fails the build on HIGH or CRITICAL. Chosen over critical-only because 21 of the 53
+      # found on the first run were HIGH and every one had a fix available - a gate that would
+      # have let all 21 through is not a gate.
+      #
+      # ⚠ DEV DEPENDENCIES ARE IN SCOPE ON PURPOSE. A compromised test runner or build plugin
+      # executes on a machine holding publish credentials, which is a worse position than most
+      # runtime dependencies occupy. `vitest` appeared in the first run's findings.
+      #
+      # ⚠ THIS GATE NEEDS NETWORK. .npmrc pins the public registry deliberately (see its
+      # header); pnpm audit queries that registry's advisory endpoint. If it is unreachable the
+      # command fails and the build fails - which is the correct direction. Do NOT add `|| true`
+      # to get past a network problem: that converts this gate into decoration, silently.
+      #
+      # ⚠⚠ DO NOT LOWER THIS TO --audit-level=low. THERE IS A PERMANENT FALSE POSITIVE HERE.
+      # At `low`, pnpm audit reports GHSA "Vercel AI SDK filetype allowlist bypass" against a
+      # module it calls `ai` at version 0.1.0, vulnerable `<5.0.52`. That is NOT the Vercel
+      # package - it is THIS WORKSPACE'S OWN `services/ai` directory. pnpm audit keys the
+      # finding on the workspace path (`paths: ['ai']`) and matches the folder name against the
+      # public registry's advisory for a package called `ai`. Verified three ways: the real
+      # package name in services/ai/package.json is `@praimana/ai-service`, no `ai`
+      # dependency exists anywhere in pnpm-lock.yaml, and grype - reading the same lockfile
+      # independently - reports zero. Lowering the threshold makes this build permanently red
+      # for a package we do not depend on, and the obvious "fix" (bumping a local version to
+      # 5.0.52) would be a meaningless change to our own service.
+      - pnpm audit --audit-level=high
+      # Gates before packaging. A bad bundle under an IMMUTABLE release key cannot be
+      # replaced later, so catching it here matters more than it does for the portal.
+      - pnpm run type-check
+      - pnpm run lint
+      - pnpm run test
+      # Asserts the vendored copy of shared/ has not drifted. It is a repo-specific
+      # invariant with its own script, so it runs rather than being reimplemented here.
+      - pnpm run check:shared
+      # Builds every workspace package except the root aggregator. Each service's esbuild
+      # bundles shared/ and service-shared/ in, and externalises @aws-sdk/* because the
+      # Lambda runtime already provides it.
+      - pnpm run build
+
+  post_build:
+    commands:
+      # CodeBuild runs post_build even after a failed phase, so without this a failing test
+      # would still publish an immutable release.
+      - |
+        if [ "${CODEBUILD_BUILD_SUCCEEDING:-1}" != "1" ]; then
+          echo "REFUSING TO PUBLISH: an earlier phase failed. Nothing uploaded."
+          exit 1
+        fi
+
+      # ---- package each service ----------------------------------------------------
+      # ⚠ THE WHOLE dist/ TREE IS COPIED, NOT dist/*, AND THAT IS NOT PEDANTRY.
+      # `cp dist/* stage/` skips DIRECTORIES and says so only on stderr, without failing.
+      # notify's build does `cp -R templates dist/templates` - six HTML email templates - so
+      # the flat copy would have published notify with its handler and none of its templates.
+      # That breaks at RUNTIME, when an email is sent, not at build time. Verified against a
+      # real build: notify/dist contains handler.js plus templates/.
+      #
+      # ⚠ THE package.json CARRYING {"type":"module"} IS NOT OPTIONAL. Every handler is an
+      # ESM bundle (esbuild --format=esm) and Lambda's Node runtime decides module type from
+      # the nearest package.json; without it, `import` at the top of handler.js throws
+      # "Cannot use import statement outside a module" on the first cold start. The published
+      # v0.6.9 zips contain exactly handler.js and that file.
+      #
+      # It is written only when the service has not produced one itself. user-projection's
+      # build already appends the identical marker, and other services may follow - a service
+      # that deliberately ships more in its package.json must not have it clobbered here.
+      - |
+        . /tmp/build.env
+        rm -rf /tmp/pkg && mkdir -p /tmp/pkg
+        : > /tmp/uploads.txt
+        while read -r svc; do
+          [ -n "$svc" ] || continue
+          dist="$svc/dist"
+          [ -d "$dist" ] || { echo "FATAL: $svc has no dist/ - did its build run?"; exit 1; }
+          [ -f "$dist/handler.js" ] || { echo "FATAL: $svc/dist/handler.js missing"; exit 1; }
+          stage="/tmp/pkg/$svc"
+          mkdir -p "$stage"
+          # -R so directories travel; a trailing /. so the CONTENTS land in stage rather than
+          # a nested dist/ that Lambda would not look inside.
+          cp -R "$dist"/. "$stage"/
+          if [ -f "$stage/package.json" ]; then
+            echo "  $svc: keeping its own dist/package.json"
+          else
+            printf '{"type":"module"}' > "$stage/package.json"
+          fi
+          # Assert the marker actually declares ESM, however it got there. A service whose
+          # own package.json omits "type" would cold-start-fail, and this is the last point
+          # at which that is cheap to notice.
+          node -e '
+            const p = require("fs").readFileSync(process.argv[1], "utf8");
+            if (JSON.parse(p).type !== "module") {
+              console.error("FATAL: " + process.argv[2] + " package.json does not declare type=module");
+              process.exit(1);
+            }' "$stage/package.json" "$svc" || exit 1
+          zip="/tmp/$svc.zip"
+          (cd "$stage" && zip -qr "$zip" .)
+          size=$(wc -c < "$zip" | tr -d '[:space:]')
+          entries=$(unzip -l "$zip" | tail -1 | awk '{print $2}')
+          printf '  %-26s %8s bytes  %s entries  sha %s\n' \
+            "$svc" "$size" "$entries" "$(sha256sum "$zip" | cut -c1-12)"
+          echo "$svc|$zip|$size|$(sha256sum "$zip" | cut -d' ' -f1)" >> /tmp/uploads.txt
+        done < /tmp/services.txt
+        echo "packaged $(wc -l < /tmp/uploads.txt | tr -d ' ') services"
+
+      # notify's templates are the one non-code payload in the tree, and losing them is a
+      # runtime failure. Asserted explicitly rather than trusted to the copy above.
+      - |
+        if grep -qx 'notify' /tmp/services.txt; then
+          n=$(unzip -l /tmp/notify.zip | grep -c 'templates/.*\.html' || true)
+          echo "  notify: $n html templates in the zip"
+          [ "$n" -gt 0 ] || { echo "FATAL: notify.zip carries no templates/ - the copy dropped them"; exit 1; }
+        fi
+
+      # Every service the workspace declares must have produced a zip. A partial release is
+      # worse than none: the app stack would deploy new code for some functions and fail to
+      # find it for others, mid-update.
+      - |
+        want=$(wc -l < /tmp/services.txt | tr -d ' ')
+        got=$(wc -l < /tmp/uploads.txt | tr -d ' ')
+        [ "$want" = "$got" ] || { echo "FATAL: $want services declared but $got packaged"; exit 1; }
+        echo "all $want services packaged"
+
+      # ---- upload, then verify each object -----------------------------------------
+      - |
+        . /tmp/build.env
+        while IFS='|' read -r svc zip size sha; do
+          key="${RELEASE_PREFIX}${svc}/${svc}.zip"
+          aws s3 cp "$zip" "s3://$SERVICES_BUCKET/$key" \
+            --metadata "release=$VERSION,commit=$COMMIT,service=$svc,sha256=$sha,build=${CODEBUILD_BUILD_NUMBER:-unknown}"
+          remote=$(aws s3api head-object --bucket "$SERVICES_BUCKET" --key "$key" \
+                     --query ContentLength --output text)
+          printf '  %-52s local=%s remote=%s\n' "$key" "$size" "$remote"
+          [ "$size" = "$remote" ] || { echo "FATAL: size differs for $key"; exit 1; }
+        done < /tmp/uploads.txt
+        echo "uploaded and verified $(wc -l < /tmp/uploads.txt | tr -d ' ') zips"
+
+      # ---- manifest, written LAST ---------------------------------------------------
+      # Its presence is what marks the release complete, which is what the overwrite guard
+      # above reads. Writing it first would make a half-finished publish look finished.
+      - |
+        . /tmp/build.env
+        node -e '
+          const fs = require("fs");
+          const rows = fs.readFileSync("/tmp/uploads.txt","utf8").trim().split("\n")
+            .map(l => l.split("|"))
+            .map(([svc,,size,sha]) => ({ service: svc, bytes: Number(size), sha256: sha,
+                   key: process.env.RELEASE_PREFIX + svc + "/" + svc + ".zip" }));
+          const m = {
+            app: "praimana",
+            component: "services",
+            // ⚠ release is BARE SEMVER and keyPrefix carries the "v". They differ by exactly
+            // that letter, and conflating them is the mistake this shape exists to prevent:
+            // `release` is what you pass to CloudFormation, `keyPrefix` is where the bytes are.
+            release: process.env.RAW,
+            keyPrefix: process.env.RELEASE_PREFIX,
+            commit: process.env.COMMIT,
+            builtBy: "praimana--services-publish pipeline",
+            buildNumber: process.env.CODEBUILD_BUILD_NUMBER || null,
+            deployWith: "ReleaseVersion=" + process.env.RAW,
+            immutable: "a published release is never overwritten; bump package.json version instead",
+            services: rows,
+          };
+          fs.writeFileSync("/tmp/manifest.json", JSON.stringify(m, null, 2));
+          console.log(JSON.stringify({release:m.release, commit:m.commit.slice(0,12), services:rows.length}));
+        '
+        aws s3 cp /tmp/manifest.json "s3://$SERVICES_BUCKET/${RELEASE_PREFIX}manifest.json" \
+          --metadata "release=$VERSION,commit=$COMMIT"
+        # ─── DEPENDENCY INVENTORY, PUBLISHED WITH THE RELEASE ─────────────────────────────
+        # ⚠ This answers a question the build gate CANNOT.
+        # `pnpm audit` tells you whether a release was clean ON THE DAY IT WAS BUILT. It cannot
+        # tell you, six months later, whether a newly disclosed CVE affects a release that is
+        # still deployed in a customer account - because by then the lockfile has moved on and
+        # the release is immutable. This inventory is the resolved tree AS SHIPPED, stored under
+        # the same immutable release key, so a future advisory can be checked against what is
+        # actually running rather than against current main.
+        #
+        # ⚠ THIS IS AN INVENTORY, NOT A CycloneDX/SPDX SBOM. It is produced by pnpm, which is
+        # already here, deliberately avoiding a curl-installed binary in the publish path - a
+        # supply-chain scanner fetched over the network at build time is itself a supply-chain
+        # dependency, which is a poor trade in the job that signs and publishes releases. If a
+        # standards-conformant SBOM is required (customer attestation, VEX workflows), add syft
+        # to the image the pipeline already trusts and emit cyclonedx-json here instead; the
+        # local equivalent is `grype dir:services -o cyclonedx-json`.
+        pnpm list --recursive --depth Infinity --json > /tmp/dependency-inventory.json || \
+          echo '{"error":"pnpm list failed; inventory not generated"}' > /tmp/dependency-inventory.json
+        aws s3 cp /tmp/dependency-inventory.json \
+          "s3://$SERVICES_BUCKET/${RELEASE_PREFIX}dependency-inventory.json" \
+          --metadata "release=$VERSION,commit=$COMMIT"
+        echo "published s3://$SERVICES_BUCKET/$RELEASE_PREFIX"
+        aws s3 ls "s3://$SERVICES_BUCKET/$RELEASE_PREFIX" --recursive | tail -20
+        echo ""
+        echo "Deploy it with: ReleaseVersion=$RAW      (no leading \"v\" - that belongs to the key)"

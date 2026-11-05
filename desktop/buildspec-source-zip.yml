@@ -1,0 +1,178 @@
+# Package the desktop SOURCE and publish a versioned zip to the
+# `desktop` bucket - the CI/CD drop box. Nothing reads that bucket: the installers
+# customers download live in `artifacts`, published by buildspec-mac.yml and
+# buildspec-win.yml. This zip exists so a source tree is retrievable per version
+# without a git clone.
+#
+# Driven by a CodeBuild project.
+# Env vars it supplies:
+#   DESKTOP_BUCKET  - destination bucket
+#   DESKTOP_PREFIX  - key prefix; must match what the bucket policy grants (desktop/)
+#
+# Two keys per build, same scheme as the portal publisher: an IMMUTABLE
+# <name>-<version>-<sha>.zip and a <name>-<version>.zip POINTER at the latest build of
+# that version. That is why no version bump is needed to publish - the commit in the key
+# makes collisions impossible rather than something to guard against.
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+
+  pre_build:
+    commands:
+      - |
+        VERSION="$(node -p "require('./package.json').version")"
+        [ -n "$VERSION" ] || { echo "FATAL: no version in package.json"; exit 1; }
+        COMMIT="${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}"
+        SHORT="${COMMIT:0:12}"
+        KEY="${DESKTOP_PREFIX}${VERSION}/desktop-${VERSION}-${SHORT}.zip"
+        POINTER="${DESKTOP_PREFIX}${VERSION}/desktop-${VERSION}.zip"
+        { echo "VERSION=$VERSION"; echo "COMMIT=$COMMIT"; echo "SHORT=$SHORT"
+          echo "KEY=$KEY"; echo "POINTER=$POINTER"; } > /tmp/build.env
+        echo "version=$VERSION commit=$SHORT"
+        echo "  immutable s3://$DESKTOP_BUCKET/$KEY"
+        echo "  pointer   s3://$DESKTOP_BUCKET/$POINTER"
+
+  build:
+    commands:
+      # Nothing to build - the installers are produced by the platform-native projects.
+      # This one only packages source, so it stays on cheap Linux compute.
+      - echo "packaging source only; installers are built by the mac and windows projects"
+
+  post_build:
+    commands:
+      # CodeBuild runs post_build even after a failed phase, so without this a failure
+      # upstream would still publish. See the same guard in the portal buildspec.
+      - |
+        if [ "${CODEBUILD_BUILD_SUCCEEDING:-1}" != "1" ]; then
+          echo "REFUSING TO PUBLISH: an earlier phase failed. Nothing uploaded."
+          exit 1
+        fi
+
+      # Whole repo minus vcs/build/scratch and test files. node_modules is excluded on
+      # principle here even though this project never installs: an electron tree carries a
+      # ~100MB platform binary that would be useless to any consumer on another platform.
+      # Test files, .kiro and .ash are dropped too — they are not needed to run the app from
+      # source and only enlarge the download.
+      - |
+        . /tmp/build.env
+        rm -rf /tmp/bundle && mkdir -p /tmp/bundle
+        tar -cf - \
+          --exclude='./.git' --exclude='./node_modules' --exclude='./dist' \
+          --exclude='./release' --exclude='./.turbo' --exclude='*.tsbuildinfo' \
+          --exclude='./.kiro' --exclude='./.ash' \
+          --exclude='*.test.ts' --exclude='*.test.tsx' \
+          --exclude='./connect.json' \
+          . | tar -xf - -C /tmp/bundle
+        echo "bundle top level:"; ls -a /tmp/bundle | grep -vE '^\.$|^\.\.$' | sed 's/^/  /'
+        echo "  files: $(find /tmp/bundle -type f | wc -l)  size: $(du -sh /tmp/bundle | cut -f1)"
+
+      # ⚠ The run-from-source entry points MUST ship, or the zip is unusable. A missing
+      # start script would be a silent regression that only a customer discovers.
+      - |
+        for required in start.sh start.bat START-HERE.md package.json pnpm-lock.yaml .npmrc; do
+          [ -e "/tmp/bundle/$required" ] || { echo "FATAL: $required missing from the bundle"; exit 1; }
+        done
+        echo "run-from-source entry points present (start.sh, start.bat, START-HERE.md)"
+        # connect.json is per-experience and user-supplied; it must NOT be in the zip.
+        [ -e "/tmp/bundle/connect.json" ] && { echo "FATAL: connect.json leaked into the bundle"; exit 1; }
+        echo "connect.json correctly absent (user adds it after download)"
+
+      # ⚠ Secret guard. Other principals can be granted read on this bucket, so a committed
+      # .env would be a credential leak rather than an untidiness. .gitignore should keep them
+      # out; this asserts it.
+      - |
+        found=$(find /tmp/bundle -name '.env' -o -name '.env.*' ! -name '.env.example' 2>/dev/null)
+        if [ -n "$found" ]; then
+          echo "FATAL: environment files in the bundle:"; echo "$found" | sed 's/^/  /'
+          exit 1
+        fi
+        for junk in node_modules .git dist release; do
+          [ -e "/tmp/bundle/$junk" ] && { echo "FATAL: $junk leaked into the bundle"; exit 1; }
+        done
+        echo "no environment files or build/vcs directories in the bundle"
+
+      - |
+        . /tmp/build.env
+        python3 - > /tmp/bundle/manifest.json <<'PY'
+        import json, os
+        print(json.dumps({
+            "app": "praimana",
+            "component": "desktop",
+            "version": os.environ["VERSION"],
+            "commit": os.environ["COMMIT"],
+            "builtBy": "praimana-desktop-publish pipeline",
+            "buildNumber": os.environ.get("CODEBUILD_BUILD_NUMBER"),
+            "contents": "whole repo minus .git/node_modules/dist/release - source only, no installers",
+            "immutableKey": os.environ["KEY"],
+            "pointerKey": os.environ["POINTER"],
+            "installersAt": "s3://praimana-artifacts<BucketNameSuffix>/desktop/{macos,windows}/",
+        }, indent=2))
+        PY
+        cat /tmp/bundle/manifest.json
+
+      # Immutable first, pointer second: a build dying between the two leaves the pointer
+      # naming a bundle that exists.
+      - |
+        . /tmp/build.env
+        ZIP=/tmp/desktop-"$VERSION"-"$SHORT".zip
+        (cd /tmp/bundle && zip -qr "$ZIP" .)
+        aws s3 cp "$ZIP" "s3://$DESKTOP_BUCKET/$KEY" \
+          --metadata "version=$VERSION,commit=$COMMIT,build=${CODEBUILD_BUILD_NUMBER:-unknown}"
+        aws s3 cp "s3://$DESKTOP_BUCKET/$KEY" "s3://$DESKTOP_BUCKET/$POINTER" \
+          --metadata-directive REPLACE \
+          --metadata "version=$VERSION,commit=$COMMIT,build=${CODEBUILD_BUILD_NUMBER:-unknown}"
+        aws s3 cp /tmp/bundle/manifest.json \
+          "s3://$DESKTOP_BUCKET/${DESKTOP_PREFIX}${VERSION}/manifest.json"
+        local_size=$(wc -c < "$ZIP" | tr -d '[:space:]')
+        for k in "$KEY" "$POINTER"; do
+          remote=$(aws s3api head-object --bucket "$DESKTOP_BUCKET" --key "$k" \
+                     --query ContentLength --output text)
+          printf '  %-56s local=%s remote=%s\n' "$k" "$local_size" "$remote"
+          [ "$local_size" = "$remote" ] || { echo "FATAL: size differs for $k"; exit 1; }
+        done
+        echo "verified both keys"
+
+      # ── ALSO PUBLISH INTO THE PER-PLATFORM PREFIXES SO "DOWNLOAD DESKTOP" SERVES THE SOURCE ZIP ──
+      #
+      # The desktop backend (services/desktop/src/s3.store.ts) presigns the NEWEST object under
+      # <DESKTOP_PREFIX><platform>/ for platform in {macos,windows} FROM THE BUCKET NAMED BY ITS
+      # OWN DESKTOP_BUCKET env — which on this deployment is the DESKTOP bucket, not the artifacts
+      # bucket. Publishing the SAME source zip into desktop/macos/ and desktop/windows/ of THIS
+      # bucket makes the portal "download desktop" button hand over the run-from-source zip with no
+      # backend or portal change.
+      #
+      # ⚠ MUST MATCH THE LAMBDA'S DESKTOP_BUCKET. An earlier version published to ARTIFACTS_BUCKET;
+      # the Lambda reads DESKTOP_BUCKET, so releases reported nothing and /welcome said "not
+      # published". The two must name the same bucket. $DESKTOP_BUCKET here is that bucket.
+      #
+      # ⚠ SAFE ONLY BECAUSE THE NATIVE BUILDS ARE OFF. buildspec-mac.yml / buildspec-win.yml publish
+      # into these same prefixes (in the ARTIFACTS bucket) and newest wins; this pipeline runs with
+      # EnableMacBuild/EnableWindowsBuild=false for the run-from-source model, so nothing else writes
+      # here. If a native build is ever re-enabled, reconcile the two targets first.
+      - |
+        . /tmp/build.env
+        ZIP=/tmp/desktop-"$VERSION"-"$SHORT".zip
+        # The key's last segment becomes the browser's download filename, so name it clearly.
+        FILENAME="Praimana-${VERSION}-source.zip"
+        sha=$(sha256sum "$ZIP" | awk '{print $1}')
+        [ -n "$sha" ] || { echo "FATAL: could not compute sha256 for the source zip"; exit 1; }
+        local_size=$(wc -c < "$ZIP" | tr -d '[:space:]')
+        # Both platform prefixes get the identical zip — the same source runs on either OS.
+        for platform in macos windows; do
+          pkey="${DESKTOP_PREFIX}${platform}/${FILENAME}"
+          aws s3 cp "$ZIP" "s3://$DESKTOP_BUCKET/$pkey" \
+            --metadata "version=$VERSION,commit=$COMMIT,build=${CODEBUILD_BUILD_NUMBER:-unknown},signed=false,sha256=$sha,kind=source-zip"
+          remote=$(aws s3api head-object --bucket "$DESKTOP_BUCKET" --key "$pkey" \
+                     --query ContentLength --output text)
+          remote_sha=$(aws s3api head-object --bucket "$DESKTOP_BUCKET" --key "$pkey" \
+                         --query 'Metadata.sha256' --output text)
+          printf '  %-56s local=%s remote=%s sha=%s\n' "$pkey" "$local_size" "$remote" "$sha"
+          [ "$local_size" = "$remote" ] || { echo "FATAL: size differs for $pkey"; exit 1; }
+          [ "$remote_sha" = "$sha" ] || { echo "FATAL: sha256 metadata missing/wrong for $pkey"; exit 1; }
+        done
+        echo "source zip published to the per-platform prefixes the desktop backend serves"
+        aws s3 ls "s3://$DESKTOP_BUCKET/${DESKTOP_PREFIX}macos/"
+        aws s3 ls "s3://$DESKTOP_BUCKET/${DESKTOP_PREFIX}windows/"

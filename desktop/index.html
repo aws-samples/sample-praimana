@@ -1,0 +1,18 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Praimana</title>
+  </head>
+  <!--
+    ⚠ NO BACKGROUND CLASS HERE. `bg-gray-50` used to sit on this element and it WON over
+    `index.css`'s themed `background-color: #111827` — a class beats an element selector — so every
+    pixel no view covered rendered LIGHT GREY inside a dark app. Visible in the reported screenshot as
+    a pale band below the chat. The colour belongs in index.css with the reasoning; see it there.
+  -->
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/renderer/main.tsx"></script>
+  </body>
+</html>

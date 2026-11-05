@@ -1,0 +1,369 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Praimana application - master template deploying all eight tiers (KMS, DynamoDB,
+  plumbing, SES, Cognito identity, API, portal, observability) as nested stacks in one
+  (two-apply) deploy.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Required}
+        Parameters: [Environment, TemplateBucket]
+      - Label: {default: Published artifacts}
+        Parameters: [ServicesBucket, ReleaseVersion, PortalBucket, PortalBundlePrefix, PortalReleaseVersion, DesktopBucket, DesktopBucketOwnerAccountId]
+      - Label: {default: Email (SES)}
+        Parameters: [SesIdentityType, SesIdentityName, EmailReplyTo, BounceNotificationEmail]
+      - Label: {default: Cognito sign-in (see the two-apply note)}
+        Parameters: [CognitoCallbackUrls, CognitoLogoutUrls, CognitoDomainPrefix]
+      - Label: {default: API}
+        Parameters: [ApiAllowedOrigins, ApiInternalBaseUrl, PortalUrl]
+      - Label: {default: Portal}
+        Parameters: [PortalDomainName, PortalCertificateArn, PortalWebAclArn, EnablePortalWaf]
+      - Label: {default: Observability}
+        Parameters: [AlertEmail, EnableCanary, CanaryBaseUrl]
+      - Label: {default: Templates}
+        Parameters: [TemplatePrefix, KeyAdministratorArn, LogRetentionInDays]
+
+Parameters:
+  Environment:
+    Type: String
+    Description: Environment tag/behaviour value, applied to every tier. REQUIRED.
+    AllowedValues: ["dev", "test", "staging", "prod", "shared"]
+
+  TemplateBucket:
+    Type: String
+    Description: >
+      S3 bucket holding the eight published tier templates (the cf-template bucket).
+      TemplateURL for each nested stack is built as
+      https://<TemplateBucket>.s3.<region>.amazonaws.com/<TemplatePrefix><tier>.yaml
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: A valid S3 bucket name.
+
+  TemplatePrefix:
+    Type: String
+    Description: Key prefix under TemplateBucket where the tier templates live.
+    Default: "templates/"
+
+  ServicesBucket:
+    Type: String
+    Description: Shared bucket holding the service Lambda zips (lambda/v<ReleaseVersion>/...). No default — supply your own bucket name.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+
+  ReleaseVersion:
+    Type: String
+    Description: Bare semver (no leading v) selecting the service Lambda zip version, e.g. 1.2.3.
+
+  PortalBucket:
+    Type: String
+    Description: Shared bucket holding the portal SOURCE zip (CodeBuild reads it). No default — supply your own bucket name.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+
+  PortalBundlePrefix:
+    Type: String
+    Default: "portal/"
+
+  PortalReleaseVersion:
+    Type: String
+    Description: Portal bundle version, e.g. 1.2.3.
+
+  DesktopBucket:
+    Type: String
+    Description: Shared bucket holding the desktop installers/source zip (presigned by the api). No default — supply your own bucket name.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+
+  DesktopBucketOwnerAccountId:
+    Type: String
+    Default: ""
+    Description: 12-digit AWS account ID that owns DesktopBucket, checked by S3 on every installer request (ExpectedBucketOwner). Leave empty when the bucket is in this account.
+    AllowedPattern: "^(\\d{12})?$"
+    ConstraintDescription: Must be a 12-digit AWS account ID, or empty for this account.
+
+  SesIdentityType:
+    Type: String
+    Description: SES identity kind. Only used when SesIdentityName is set.
+    AllowedValues: ["EmailAddress", "Domain"]
+    Default: "EmailAddress"
+
+  SesIdentityName:
+    Type: String
+    Description: >
+      Email address or domain to verify in SES. EMPTY = skip SES (recommended unless you have
+      a verifiable identity). A verification email is sent to an EmailAddress identity; a
+      Domain identity needs DKIM DNS records published.
+    Default: ""
+
+  EmailReplyTo:
+    Type: String
+    Default: ""
+
+  BounceNotificationEmail:
+    Type: String
+    Default: ""
+
+  CognitoCallbackUrls:
+    Type: CommaDelimitedList
+    Description: >
+      OAuth2 callback URLs for Cognito. Leave at the placeholder on apply 1; set to the
+      portal's real callback URL on apply 2 (output PortalCallbackUrlForSecondApply).
+    Default: "https://example.invalid/api/auth/callback/cognito"
+
+  CognitoLogoutUrls:
+    Type: CommaDelimitedList
+    Description: Sign-out redirect URLs. Placeholder on apply 1; real portal logout route on apply 2.
+    Default: "https://example.invalid/login"
+
+  CognitoDomainPrefix:
+    Type: String
+    Description: >
+      REQUIRED. Hosted-UI domain prefix: <prefix>.auth.<region>.amazoncognito.com. Globally unique
+      across all AWS accounts, so choose a value of your own; it must not contain "aws", "amazon" or
+      "cognito". Passed unchanged to the identity, API and portal tiers. Sign-in uses the hosted UI,
+      so there is no empty setting and no account-id fallback.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+    ConstraintDescription: Required. Lowercase alphanumerics and dashes, starting with a letter or digit.
+
+  ApiAllowedOrigins:
+    Type: CommaDelimitedList
+    Description: CORS origins the API accepts (normally the portal origin). REQUIRED - no wildcard default.
+
+  ApiInternalBaseUrl:
+    Type: String
+    Description: >
+      East-west base URL for the API (https://.../v1). Leave EMPTY on apply 1; set from the
+      ApiInternalBaseUrlForSecondApply output on apply 2.
+    Default: ""
+    AllowedPattern: "^$|^https://[^\\s]+/v1$"
+    ConstraintDescription: Empty, or an https URL ending in /v1.
+
+  PortalUrl:
+    Type: String
+    Description: Portal origin used in invite/join links (not the API domain). Empty is acceptable.
+    Default: ""
+
+  PortalDomainName:
+    Type: String
+    Description: >
+      REQUIRED. Hostname the portal is served on, e.g. portal.example.com. A custom domain is what
+      lets the distribution enforce TLSv1.2_2021; the default *.cloudfront.net certificate is fixed
+      at TLSv1. After apply 1, point it at the PortalDistributionDomainName output.
+    AllowedPattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+    ConstraintDescription: Required. A lowercase fully-qualified hostname, with no scheme and no trailing dot.
+
+  PortalCertificateArn:
+    Type: String
+    Description: REQUIRED. Issued ACM certificate in us-east-1 that covers PortalDomainName.
+    AllowedPattern: "^arn:aws[a-z-]*:acm:us-east-1:[0-9]{12}:certificate/[a-f0-9-]+$"
+    ConstraintDescription: Required. An ACM certificate ARN in us-east-1.
+
+  PortalWebAclArn:
+    Type: String
+    Default: ""
+
+  EnablePortalWaf:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+  AlertEmail:
+    Type: String
+    Description: Up to 5 comma-separated alarm recipients, no spaces. Empty = topic created, nobody subscribed.
+    Default: ""
+
+  EnableCanary:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+  CanaryBaseUrl:
+    Type: String
+    Description: URL the liveness canary probes. Empty = the api's own invoke URL.
+    Default: ""
+
+  KeyAdministratorArn:
+    Type: String
+    Description: IAM principal that administers the KMS key. Empty = account root (set in prod).
+    Default: ""
+
+  LogRetentionInDays:
+    Type: String
+    Default: "30"
+
+Conditions:
+  EnableSes: !Not [!Equals [!Ref SesIdentityName, ""]]
+
+Resources:
+
+  KmsStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}platform-kms.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        KeyAdministratorArn: !Ref KeyAdministratorArn
+      Tags:
+        - {Key: ApplicationName, Value: Praimana}
+        - {Key: Environment, Value: !Ref Environment}
+
+  DynamoDbStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}platform-dynamodb.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+      Tags:
+        - {Key: ApplicationName, Value: Praimana}
+        - {Key: Environment, Value: !Ref Environment}
+
+  PlumbingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}platform-plumbing.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+      Tags:
+        - {Key: ApplicationName, Value: Praimana}
+        - {Key: Environment, Value: !Ref Environment}
+
+  SesStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: EnableSes
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}platform-ses.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+        IdentityType: !Ref SesIdentityType
+        IdentityName: !Ref SesIdentityName
+        BounceNotificationEmail: !Ref BounceNotificationEmail
+      Tags:
+        - {Key: ApplicationName, Value: Praimana}
+        - {Key: Environment, Value: !Ref Environment}
+
+  IdentityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}platform-identity.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+        CognitoCallbackUrls: !Join [",", !Ref CognitoCallbackUrls]
+        CognitoLogoutUrls: !Join [",", !Ref CognitoLogoutUrls]
+        CognitoDomainPrefix: !Ref CognitoDomainPrefix
+        EmailFrom: !If [EnableSes, !GetAtt SesStack.Outputs.EmailFromHint, ""]
+        EmailReplyTo: !Ref EmailReplyTo
+        LogRetentionInDays: !Ref LogRetentionInDays
+        ReleaseVersion: !Ref ReleaseVersion
+        ServicesBucket: !Ref ServicesBucket
+      Tags:
+        - {Key: ApplicationName, Value: Praimana}
+        - {Key: Environment, Value: !Ref Environment}
+
+  ApiStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}platform-api.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+        ApiAllowedOrigins: !Join [",", !Ref ApiAllowedOrigins]
+        CognitoDomainPrefix: !Ref CognitoDomainPrefix
+        ServicesBucket: !Ref ServicesBucket
+        ReleaseVersion: !Ref ReleaseVersion
+        DesktopBucket: !Ref DesktopBucket
+        DesktopBucketOwnerAccountId: !Ref DesktopBucketOwnerAccountId
+        EmailFrom: !If [EnableSes, !GetAtt SesStack.Outputs.EmailFromHint, ""]
+        EmailReplyTo: !Ref EmailReplyTo
+        PortalUrl: !Ref PortalUrl
+        InternalBaseUrl: !Ref ApiInternalBaseUrl
+        LogRetentionInDays: !Ref LogRetentionInDays
+        UserPoolId: !GetAtt IdentityStack.Outputs.UserPoolId
+        UserPoolClientId: !GetAtt IdentityStack.Outputs.UserPoolClientId
+        DeadLetterQueueArn: !GetAtt PlumbingStack.Outputs.DeadLetterQueueArn
+        DocsBucketName: !GetAtt PlumbingStack.Outputs.DocsBucketName
+        ResourcesBucketName: !GetAtt PlumbingStack.Outputs.ResourcesBucketName
+        UsersTableStreamArn: !GetAtt DynamoDbStack.Outputs.UsersTableStreamArn
+      Tags:
+        - {Key: ApplicationName, Value: Praimana}
+        - {Key: Environment, Value: !Ref Environment}
+
+  PortalStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}platform-portal.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+        CognitoDomainPrefix: !Ref CognitoDomainPrefix
+        PortalBucket: !Ref PortalBucket
+        PortalBundlePrefix: !Ref PortalBundlePrefix
+        PortalReleaseVersion: !Ref PortalReleaseVersion
+        PortalDomainName: !Ref PortalDomainName
+        PortalCertificateArn: !Ref PortalCertificateArn
+        PortalWebAclArn: !Ref PortalWebAclArn
+        EnablePortalWaf: !Ref EnablePortalWaf
+        ResourcesBucketName: !GetAtt PlumbingStack.Outputs.ResourcesBucketName
+        ApiId: !GetAtt ApiStack.Outputs.ApiId
+        UserPoolId: !GetAtt IdentityStack.Outputs.UserPoolId
+        UserPoolClientId: !GetAtt IdentityStack.Outputs.UserPoolClientId
+      Tags:
+        - {Key: ApplicationName, Value: Praimana}
+        - {Key: Environment, Value: !Ref Environment}
+
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplateBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatePrefix}platform-observability.yaml"
+      Parameters:
+        Environment: !Ref Environment
+        KmsKeyArn: !GetAtt KmsStack.Outputs.KmsKeyArn
+        AlertEmail: !Ref AlertEmail
+        EnableCanary: !Ref EnableCanary
+        CanaryBaseUrl: !Ref CanaryBaseUrl
+        ApiId: !GetAtt ApiStack.Outputs.ApiId
+        CanaryArtifactsBucketName: !GetAtt PlumbingStack.Outputs.CanaryArtifactsBucketName
+        DeadLetterQueueName: !GetAtt PlumbingStack.Outputs.DeadLetterQueueName
+      Tags:
+        - {Key: ApplicationName, Value: Praimana}
+        - {Key: Environment, Value: !Ref Environment}
+
+Outputs:
+  PortalUrlOut:
+    Description: The portal's served URL.
+    Value: !GetAtt PortalStack.Outputs.PortalUrl
+
+  PortalDistributionDomainName:
+    Description: Create a DNS record from PortalDomainName to this CloudFront hostname after apply 1.
+    Value: !GetAtt PortalStack.Outputs.PortalDistributionDomainName
+
+  PortalSessionSecretArn:
+    Description: Secrets Manager secret holding the portal session-signing key (generated at create).
+    Value: !GetAtt PortalStack.Outputs.PortalSessionSecretArn
+
+  ApiEndpoint:
+    Description: The HTTP API base endpoint.
+    Value: !GetAtt ApiStack.Outputs.ApiEndpoint
+
+  PortalCallbackUrlForSecondApply:
+    Description: >
+      Pass as CognitoCallbackUrls on apply 2 so Cognito accepts the portal's real sign-in
+      redirect. Until then interactive sign-in returns redirect_mismatch.
+    Value: !GetAtt PortalStack.Outputs.CognitoCallbackUrlForIdentityTier
+
+  ApiInternalBaseUrlForSecondApply:
+    Description: Pass as ApiInternalBaseUrl on apply 2 to enable east-west service calls.
+    Value: !GetAtt ApiStack.Outputs.InternalBaseUrlForSecondPass
+
+  PortalBuildProjectName:
+    Description: CodeBuild project to start after apply 1 to build and ship the portal bundle.
+    Value: !GetAtt PortalStack.Outputs.PortalBuildProjectName
+
+  UserPoolId:
+    Value: !GetAtt IdentityStack.Outputs.UserPoolId
+
+  SeedingReminder:
+    Description: >
+      After apply 1, run the two data-seed steps from aws/app/README.md (create first admin,
+      seed the format catalogue). They are DynamoDB writes, not part of this stack.
+    Value: "See aws/app/README.md steps 10-11 (first admin, format catalogue)."

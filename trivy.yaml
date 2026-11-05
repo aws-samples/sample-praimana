@@ -1,0 +1,3 @@
+# Loaded automatically by trivy when run from the repository root. Points trivy at the YAML
+# ignore file, which it does not read by default (its default is a plain `.trivyignore`).
+ignorefile: .trivyignore.yaml

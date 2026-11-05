@@ -1,0 +1,20 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    // Vendored shared code — see README. Renamed with the product.
+    "paths": { "@praimana/shared": ["./shared/index.ts"] },
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "outDir": "dist",
+    // ⚠ "." NOT "src": the vendored `shared/` folder sits beside src/, and a rootDir of "src" makes tsc
+    // reject every file in it with TS6059 ("not under rootDir").
+    "rootDir": ".",
+    "strict": true,
+    "skipLibCheck": true
+  },
+  "include": ["src/renderer/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

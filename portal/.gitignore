@@ -1,0 +1,35 @@
+# Build output and dependencies — never committed.
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.turbo/
+coverage/
+test-results/
+# Playwright's other two output dirs. `test-results/` above already covered traces and
+# screenshots; these are the HTML reporter and the sharded-run blobs, both regenerated per run.
+# A committed report is a snapshot of one machine's run masquerading as the suite's state.
+playwright-report/
+blob-report/
+.DS_Store
+
+# ⚠ THE REAL ENV FILES STAY OUT. A populated `.env` carries live values —
+# NEXTAUTH_SECRET, COGNITO_CLIENT_SECRET, DESKTOP_ACCESS_KEY_SECRET, GITHUB_TOKEN — so it is NOT committed
+# to this repo. `.env.example` (committed, values blank) is the list of variables; fill a local `.env`
+# from it. See README, "Configuration".
+#
+# ⚠ `.env.*` RATHER THAN THE THREE NARROWER RULES IT REPLACES (`.env.local`, `.env*.local`). Those matched
+# the two filenames anyone actually creates and MISSED every other one: `.env.production`,
+# `.env.development`, `.env.staging` were all committable. A gitignore for secrets has to fail safe, and
+# the enumerating form fails open on exactly the file somebody adds in a hurry.
+#
+# The negation MUST stay below the glob — `.env.*` matches `.env.example` too, and gitignore resolves by
+# last-match-wins. Inverting these two lines silently drops the committed template from the repo's view.
+.env
+.env.*
+!.env.example
+
+# ASH security scan output — full file inventories and finding locations, regenerated on every run.
+# Never committed: it is a map of the codebase written for an attacker's convenience, and it is derived
+# data besides.
+.ash/

@@ -1,0 +1,1272 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Praimana - the App-account data layer: 35 DynamoDB tables with their
+  indexes. Creates no IAM, no compute and no network. Table names are fixed literals,
+  so only one copy of this stack can be deployed per account and region.
+
+Parameters:
+  KmsKeyArn:
+    Type: String
+    Description: >
+      ARN of the customer-managed KMS key from platform-kms.yaml (tier 0). REQUIRED, no
+      default. Encrypts all 35 tables via SSESpecification below.
+
+      ⚠ REQUIRED RATHER THAN OPTIONAL ON PURPOSE. An optional key would mean wrapping every
+      SSESpecification in an Fn::If, and neither cfn_nag nor checkov can resolve an intrinsic -
+      the 70 findings this change exists to clear would stay open, exactly as W73 did for
+      BillingMode. See the note above Resources. A required parameter is the only shape that
+      both encrypts the data and closes the finding.
+
+      ⚠ THIS MAKES THE KMS TIER A HARD PREREQUISITE. platform-dynamodb.yaml was tier 1 and is
+      now tier 2; nothing in this stack can deploy until the key exists.
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+$"
+    ConstraintDescription: >
+      Must be a full KMS key ARN, not a key id and not an alias. DynamoDB's KMSMasterKeyId
+      accepts an alias, but an alias can be repointed at a different key without this stack
+      changing, which would silently split the fleet's data across two keys.
+
+  Environment:
+    Type: String
+    Description: >
+      Environment tag applied to every table. REQUIRED, no default - a wrong environment
+      tag is worse than a failed deploy, because it silently corrupts cost allocation and
+      can mislead an automated cleanup process. Matches the vocabulary the CI/CD pipeline
+      enforces on its own stacks.
+    AllowedValues: ["dev", "test", "staging", "prod", "shared"]
+
+Resources:
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-users
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: email, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - { AttributeName: email, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-accounts
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: provider_providerAccountId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: provider_providerAccountId, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: provider-providerAccountId-index
+          KeySchema:
+            - { AttributeName: provider_providerAccountId, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-sessions
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: sessionToken, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: id, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: sessionToken-index
+          KeySchema:
+            - { AttributeName: sessionToken, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  VerificationTokensTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-verification-tokens
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: identifier, AttributeType: S }
+        - { AttributeName: token, AttributeType: S }
+      KeySchema:
+        - { AttributeName: identifier, KeyType: HASH }
+        - { AttributeName: token, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  SendQuotaTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-send-quota
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  WorkshopsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-workshops
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: ownerId, AttributeType: S }
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+      KeySchema:
+        - { AttributeName: ownerId, KeyType: HASH }
+        - { AttributeName: id, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: id-index
+          KeySchema:
+            - { AttributeName: id, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+        - IndexName: ownerId-status-index
+          KeySchema:
+            - { AttributeName: ownerId, KeyType: HASH }
+            - { AttributeName: status, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  PhasesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-phases
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: workshopId, AttributeType: S }
+        - { AttributeName: order, AttributeType: N }
+      KeySchema:
+        - { AttributeName: workshopId, KeyType: HASH }
+        - { AttributeName: order, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  TeamPhasesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-team-phases
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: phaseId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: phaseId, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  TeamsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-teams
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: workshopId, AttributeType: S }
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: inviteCode, AttributeType: S }
+      KeySchema:
+        - { AttributeName: workshopId, KeyType: HASH }
+        - { AttributeName: id, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: id-index
+          KeySchema:
+            - { AttributeName: id, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+        - IndexName: inviteCode-index
+          KeySchema:
+            - { AttributeName: inviteCode, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  BulkBatchesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-bulk-batches
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: workshopId, AttributeType: S }
+        - { AttributeName: batchId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: workshopId, KeyType: HASH }
+        - { AttributeName: batchId, KeyType: RANGE }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  TeamMembersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-team-members
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: userId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: userId, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: userId-index
+          KeySchema:
+            - { AttributeName: userId, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-tasks
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: status, AttributeType: S }
+        - { AttributeName: assigneeId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: id, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: teamId-status-index
+          KeySchema:
+            - { AttributeName: teamId, KeyType: HASH }
+            - { AttributeName: status, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: assigneeId-index
+          KeySchema:
+            - { AttributeName: assigneeId, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  MessagesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-messages
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: createdAt, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  AIThreadsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-ai-threads
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: id, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: id-index
+          KeySchema:
+            - { AttributeName: id, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  TeamAiRatingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-team-ai-ratings
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: generationId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: generationId, KeyType: RANGE }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  AIMessagesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-ai-messages
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: threadId, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: threadId, KeyType: HASH }
+        - { AttributeName: createdAt, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  SubmissionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-submissions-v2
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: workshopId, AttributeType: S }
+        - { AttributeName: releasedAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: id, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: byId
+          KeySchema:
+            - { AttributeName: id, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+        - IndexName: byWorkshop
+          KeySchema:
+            - { AttributeName: workshopId, KeyType: HASH }
+            - { AttributeName: releasedAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  ScoresTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-scores
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: submissionId, AttributeType: S }
+        - { AttributeName: judgeId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: submissionId, KeyType: HASH }
+        - { AttributeName: judgeId, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  GitCommitsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-git-commits
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: date, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: date, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  GitFilesTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-git-files
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: path, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: path, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  FormatsTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-formats
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: category, AttributeType: S }
+        - { AttributeName: name, AttributeType: S }
+      KeySchema:
+        - { AttributeName: category, KeyType: HASH }
+        - { AttributeName: name, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-audit
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: subjectId, AttributeType: S }
+        - { AttributeName: at, AttributeType: S }
+        - { AttributeName: actorId, AttributeType: S }
+        - { AttributeName: teamId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: subjectId, KeyType: HASH }
+        - { AttributeName: at, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: actor-index
+          KeySchema:
+            - { AttributeName: actorId, KeyType: HASH }
+            - { AttributeName: at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: teamId-index
+          KeySchema:
+            - { AttributeName: teamId, KeyType: HASH }
+            - { AttributeName: at, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  InvitationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-invitations
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: email, AttributeType: S }
+        - { AttributeName: tokenHash, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: email, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - { AttributeName: email, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+        - IndexName: tokenHash-index
+          KeySchema:
+            - { AttributeName: tokenHash, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  MemberRatingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-member-ratings-v2
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: id, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  WorkshopResultsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-workshop-results
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: workshopId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: workshopId, KeyType: HASH }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  FeedbackTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-feedback
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+        - { AttributeName: entity, AttributeType: S }
+        - { AttributeName: createdAt, AttributeType: S }
+        - { AttributeName: unread, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: byCreated
+          KeySchema:
+            - { AttributeName: entity, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+        - IndexName: unread
+          KeySchema:
+            - { AttributeName: unread, KeyType: HASH }
+            - { AttributeName: createdAt, KeyType: RANGE }
+          Projection: { ProjectionType: KEYS_ONLY }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  CostCacheTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-cost-cache
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  AiUsersReadModel:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-ai-users-readmodel
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  TeamUsersReadModel:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-team-users-readmodel
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  CollaborationUsersReadModel:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-collaboration-users-readmodel
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  EvaluationUsersReadModel:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-evaluation-users-readmodel
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  SourceUsersReadModel:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-source-users-readmodel
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  DocsUsersReadModel:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-docs-users-readmodel
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: id, KeyType: HASH }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  EvaluationActivityReadModel:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-evaluation-activity-readmodel
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: userId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: userId, KeyType: RANGE }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+  DocsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      TableName: praimana-docs
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref KmsKeyArn
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: teamId, AttributeType: S }
+        - { AttributeName: path, AttributeType: S }
+      KeySchema:
+        - { AttributeName: teamId, KeyType: HASH }
+        - { AttributeName: path, KeyType: RANGE }
+      Tags:
+        - { Key: Environment, Value: !Ref Environment }
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: auto-delete, Value: "never" }
+
+Outputs:
+  UsersTableName:
+    Description: Name of the users table.
+    Value: !Ref UsersTable
+
+  UsersTableStreamArn:
+    Description: >
+      DynamoDB stream ARN for the users table - the only stream in the data layer, and the
+      one value a compute stack genuinely needs from here (its EventSourceMapping consumes
+      it to drive the user-projection read models).
+    Value: !GetAtt UsersTable.StreamArn
+
+  TableCount:
+    Description: How many tables this stack manages, so a drift check has something to compare.
+    Value: "35"

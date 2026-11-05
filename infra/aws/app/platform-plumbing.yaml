@@ -1,0 +1,442 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Praimana - the App-account plumbing tier: the EventBridge bus, the
+  dead-letter queue, and the docs, workshop-resources, docs-access-log and canary-artifact
+  buckets. Creates no IAM and no compute. The bus and queue names are fixed and bucket names
+  are derived from this stack's id (or BucketSuffix), so deploy one copy per account and region.
+
+Parameters:
+  KmsKeyArn:
+    Type: String
+    Description: >
+      ARN of the customer-managed KMS key from platform-kms.yaml (tier 0). REQUIRED, no
+      default. Enables a customer-managed KMS key for encryption at rest.
+
+      ⚠ REQUIRED RATHER THAN OPTIONAL ON PURPOSE. An optional key would mean wrapping every
+      encryption property in an Fn::If, and neither cfn_nag nor checkov can resolve an
+      intrinsic - the findings this exists to clear would stay open, exactly as W73 did for
+      the BillingMode parameter. A required parameter is the only shape that both encrypts
+      and closes the finding.
+
+      ⚠ Pass the full ARN, not a key id and not an alias: an alias can be repointed at a
+      different key without this stack changing.
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+$"
+    ConstraintDescription: Must be a full KMS key ARN from the tier-0 KMS stack.
+
+  Environment:
+    Type: String
+    Description: >
+      Environment tag applied to every resource here. REQUIRED, no default - a wrong
+      environment tag silently corrupts cost allocation and can mislead an automated cleanup.
+    AllowedValues: ["dev", "test", "staging", "prod", "shared"]
+
+  BucketSuffix:
+    Type: String
+    Description: >
+      Appended to the docs, access-log and canary bucket names so they can be made globally
+      unique. EMPTY (the default) derives them from this stack's own id (the last 12 hex digits
+      of its UUID), which is unique and, unlike the account id, reveals nothing about the
+      account - so empty is the normal setting, and this exists for the case where you want a
+      name of your own. The bare name "praimana" is never used.
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9-]*$"
+    ConstraintDescription: Must be empty, or lowercase alphanumerics and dashes.
+
+  ResourceCorsOrigin:
+    Type: String
+    Description: >
+      The portal origin allowed to upload workshop resources from a browser, e.g.
+      https://portal.example.com. A facilitator's browser PUTs multipart parts DIRECTLY to
+      ResourcesBucket - 100MB cannot travel through API Gateway (10MB) or Lambda (6MB) - so the bucket
+      needs a CORS rule naming the origin the JavaScript runs on.
+
+      ⚠ CORS IS NOT AN ACCESS CONTROL AND MUST NOT BE MISTAKEN FOR ONE. What authorizes the PUT is the
+      presigned signature, which the Workshop service mints only for the experience's owner; CORS only
+      decides whether the browser lets its own JavaScript READ the response. The default "*" is
+      therefore not a hole - it grants nothing - but naming the origin is still preferred, because a
+      wildcard here tells a later reader that any origin was intended when it was only unconfigured.
+    Default: "*"
+
+Conditions:
+  HasBucketSuffix: !Not [!Equals [!Ref BucketSuffix, ""]]
+
+Resources:
+  EventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: praimana-events
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: ApplicationName, Value: "Praimana"}
+        - {Key: auto-delete, Value: "never"}
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      QueueName: praimana-dlq
+      Tags:
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: ApplicationName, Value: "Praimana"}
+        - {Key: auto-delete, Value: "never"}
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref KmsKeyArn
+      KmsDataKeyReusePeriodSeconds: 300
+
+  DocsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - HasBucketSuffix
+        - !Sub "praimana-${BucketSuffix}"
+        - !Sub
+          - "praimana-${StackSuffix}"
+          - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKeyArn
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref DocsAccessLogBucket
+        LogFilePrefix: docs-bucket/
+      Tags:
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DocsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DocsBucket.Arn
+              - !Sub "${DocsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  ResourcesBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - HasBucketSuffix
+        - !Sub "praimana-workshop-resources-${BucketSuffix}"
+        - !Sub
+          - "praimana-workshop-resources-${StackSuffix}"
+          - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref KmsKeyArn
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      CorsConfiguration:
+        CorsRules:
+          - Id: PortalMultipartUpload
+            AllowedOrigins: [!Ref ResourceCorsOrigin]
+            AllowedMethods: [PUT, GET, HEAD]
+            AllowedHeaders: ["*"]
+            ExposedHeaders: [ETag]
+            MaxAge: 3000
+      LoggingConfiguration:
+        DestinationBucketName: !Ref DocsAccessLogBucket
+        LogFilePrefix: workshop-resources-bucket/
+      Tags:
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: Environment, Value: !Ref Environment }
+
+  ResourcesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ResourcesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ResourcesBucket.Arn
+              - !Sub "${ResourcesBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  DocsAccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >-
+              This bucket IS the log-delivery target. Self-logging recurses unboundedly.Cross-pointing was evaluated and is blocked by S3's
+              same-account-and-Region requirement for server access logging across this
+              three-account platform.
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              This bucket IS the log-delivery target for the platform's other buckets.
+              Self-logging recurses: every delivered log object is itself an event to be logged.
+              Residual stated openly - reads of the access logs are not themselves audited; if
+              that is required the answer is CloudTrail data events, not self-referential S3
+              logging.
+    Properties:
+      BucketName: !If
+        - HasBucketSuffix
+        - !Sub "praimana-logs-${BucketSuffix}"
+        - !Sub
+          - "praimana-logs-${StackSuffix}"
+          - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-access-logs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration: { NoncurrentDays: 365 }
+          - Id: clean-expired-delete-markers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 7 }
+      Tags:
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: Environment, Value: !Ref Environment }
+
+  DocsAccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DocsAccessLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DocsAccessLogBucket.Arn
+              - !Sub "${DocsAccessLogBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AllowS3LogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${DocsAccessLogBucket.Arn}/docs-bucket/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub
+                  - "arn:${AWS::Partition}:s3:::${name}"
+                  - name: !If
+                      - HasBucketSuffix
+                      - !Sub "praimana-${BucketSuffix}"
+                      - !Sub
+                        - "praimana-${StackSuffix}"
+                        - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+          - Sid: AllowS3LogDeliveryWorkshopResources
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${DocsAccessLogBucket.Arn}/workshop-resources-bucket/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub
+                  - "arn:${AWS::Partition}:s3:::${name}"
+                  - name: !If
+                      - HasBucketSuffix
+                      - !Sub "praimana-workshop-resources-${BucketSuffix}"
+                      - !Sub
+                        - "praimana-workshop-resources-${StackSuffix}"
+                        - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+          - Sid: AllowS3LogDeliveryCanary
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${DocsAccessLogBucket.Arn}/canary-artifacts/*"
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref "AWS::AccountId"
+              ArnLike:
+                aws:SourceArn: !Sub
+                  - "arn:${AWS::Partition}:s3:::${name}"
+                  - name: !If
+                      - HasBucketSuffix
+                      - !Sub "praimana-canary-${BucketSuffix}"
+                      - !Sub
+                        - "praimana-canary-${StackSuffix}"
+                        - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+
+  CanaryArtifactsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !If
+        - HasBucketSuffix
+        - !Sub "praimana-canary-${BucketSuffix}"
+        - !Sub
+          - "praimana-canary-${StackSuffix}"
+          - StackSuffix: !Select [4, !Split ["-", !Select [2, !Split ["/", !Ref "AWS::StackId"]]]]
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-canary-artifacts
+            Status: Enabled
+            ExpirationInDays: 30
+            NoncurrentVersionExpiration: { NoncurrentDays: 30 }
+          - Id: clean-expired-delete-markers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: { DaysAfterInitiation: 1 }
+      LoggingConfiguration:
+        DestinationBucketName: !Ref DocsAccessLogBucket
+        LogFilePrefix: canary-artifacts/
+      Tags:
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: Environment, Value: !Ref Environment }
+
+  CanaryArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CanaryArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CanaryArtifactsBucket.Arn
+              - !Sub "${CanaryArtifactsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+Outputs:
+  EventBusName:
+    Description: Name of the application event bus.
+    Value: !Ref EventBus
+
+  EventBusArn:
+    Description: ARN of the application event bus.
+    Value: !GetAtt EventBus.Arn
+
+  DeadLetterQueueArn:
+    Description: >
+      ARN of the shared DLQ. Retains 14 days of undelivered events; four functions in the
+      compute tier target it.
+    Value: !GetAtt DeadLetterQueue.Arn
+
+  DeadLetterQueueUrl:
+    Description: Queue URL, for reading the DLQ after an incident.
+    Value: !Ref DeadLetterQueue
+
+  DeadLetterQueueName:
+    Description: >
+      DLQ name, for the observability tier's DeadLetterQueueName parameter. Dimensions the
+      ApproximateNumberOfMessagesVisible alarm; SQS metrics key on QueueName, not ARN.
+    Value: !GetAtt DeadLetterQueue.QueueName
+
+  DocsBucketName:
+    Description: Docs bucket, as actually rendered - derived from this stack's id unless BucketSuffix was set.
+    Value: !Ref DocsBucket
+
+  ResourcesBucketName:
+    Description: >
+      Workshop-resources bucket, as actually rendered. Feeds the compute tier's ResourcesBucketName
+      parameter, which becomes RESOURCES_BUCKET on the Workshop function. ⚠ Absent means the Workshop
+      service answers 501 on every resource route rather than failing inside the SDK - see
+      services/workshop/src/app.ts.
+    Value: !Ref ResourcesBucket
+
+  DocsAccessLogBucketName:
+    Description: Where docs-bucket and workshop-resources-bucket access logs land, under separate prefixes. 365-day expiry.
+    Value: !Ref DocsAccessLogBucket
+
+  CanaryArtifactsBucketName:
+    Description: >
+      Canary artifacts, 30-day expiry. Created unconditionally - see difference 2 in the
+      header - so the compute tier can enable the canary without a second parameter matching.
+    Value: !Ref CanaryArtifactsBucket

@@ -1,0 +1,26 @@
+{
+  "name": "@praimana/bulk-provision-service",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT-0",
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/handler.ts --bundle --minify --platform=node --target=node22 --outdir=dist --format=esm --banner:js=\"import{createRequire as __cr}from'module';const require=__cr(import.meta.url);\" --external:@aws-sdk/*",
+    "type-check": "tsc --noEmit",
+    "lint": "eslint src/",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@praimana/service-shared": "workspace:*",
+    "@aws-sdk/client-lambda": "3.1113.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "8.10.162",
+    "@types/node": "22.20.1",
+    "esbuild": "0.25.12",
+    "eslint": "9.39.5",
+    "typescript": "5.9.3",
+    "vitest": "4.1.12"
+  }
+}

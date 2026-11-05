@@ -1,0 +1,34 @@
+{
+  "Statement": [
+    {
+      "Sid": "AllowAllOtherUpdates",
+      "Effect": "Allow",
+      "Action": "Update:*",
+      "Principal": "*",
+      "Resource": "*"
+    },
+    {
+      "Sid": "ProtectBucketsFromReplaceOrDelete",
+      "Effect": "Deny",
+      "Action": [
+        "Update:Replace",
+        "Update:Delete"
+      ],
+      "Principal": "*",
+      "Resource": [
+        "LogicalResourceId/ServicesBucket",
+        "LogicalResourceId/ArtifactsBucket",
+        "LogicalResourceId/DesktopBucket",
+        "LogicalResourceId/PortalBucket",
+        "LogicalResourceId/CfTemplateBucket",
+        "LogicalResourceId/ServicesBucketPolicy",
+        "LogicalResourceId/ArtifactsBucketPolicy",
+        "LogicalResourceId/DesktopBucketPolicy",
+        "LogicalResourceId/PortalBucketPolicy",
+        "LogicalResourceId/CfTemplateBucketPolicy",
+        "LogicalResourceId/AccessLogBucket",
+        "LogicalResourceId/AccessLogBucketPolicy"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,1259 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Single-account S3 buckets for the Praimana: Lambda code zips
+  (services), desktop installers (artifacts), a CI/CD zip drop box (desktop),
+  portal source zips (portal) and the published app tier templates
+  (cf-template). Private, versioned, delete-protected, SSE-S3, with
+  per-prefix grants for readers (CustomerPrincipals, which includes the
+  deploy role) and publishers (CicdPrincipals). Phased per bucket via the *BucketMode
+  parameters - see "Bucket modes" in infra/aws/shared/README.md.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: {default: Access (readers and publishers)}
+        Parameters:
+          - CustomerPrincipals
+          - CicdPrincipals
+          - CicdCanDelete
+          - EnableDeleteProtection
+      - Label: {default: Rollout phasing (per bucket - see file header)}
+        Parameters:
+          - ServicesBucketMode
+          - ArtifactsBucketMode
+          - DesktopBucketMode
+          - PortalBucketMode
+          - CfTemplateBucketMode
+      - Label: {default: Bucket names}
+        Parameters:
+          - ServicesBucketName
+          - ArtifactsBucketName
+          - DesktopBucketName
+          - PortalBucketName
+          - CfTemplateBucketName
+      - Label: {default: Tagging}
+        Parameters:
+          - Environment
+          - ApplicationName
+          - AutoDelete
+      - Label: {default: Key prefixes (read access is scoped to these)}
+        Parameters:
+          - LambdaPrefix
+          - ArtifactsPrefix
+          - DesktopPrefix
+          - PortalPrefix
+          - CfTemplatePrefix
+
+Parameters:
+  Environment:
+    Type: String
+    Description: >
+      Environment tag value. REQUIRED - no default, so it is always an explicit choice.
+      Adjust AllowedValues if your organisation uses a different vocabulary.
+    AllowedValues: ["dev", "test", "staging", "prod", "shared"]
+
+  ApplicationName:
+    Type: String
+    Description: ApplicationName tag value, applied to all four buckets.
+    Default: "Praimana"
+
+  AutoDelete:
+    Type: String
+    Description: >
+      auto-delete tag value. "never" marks these buckets as exempt from any automated
+      cleanup - correct here: `services` holds the Lambda zips live stacks reference, and
+      `artifacts` holds the installers customers download and has no backup.
+    Default: "never"
+
+  CustomerPrincipals:
+    Type: CommaDelimitedList
+    Description: >
+      Principals granted READ access to the services, artifacts and portal buckets,
+      each scoped to that bucket's prefix. INCLUDE THE DEPLOY ROLE HERE - it
+      is just another reader: its CloudFormation deploy pulls Lambda zips from
+      `services` and its desktop-download Lambda presigns installers from `artifacts`.
+      Comma-separated IAM principal ARNs: use
+      arn:aws:iam::<account-id>:root to mean "any principal in that account" (the
+      account's own IAM policies then decide who), or a role ARN to narrow it
+      further. Leave EMPTY (the default) and no customer statement is emitted at all.
+      The desktop bucket NEVER grants these principals anything - it is CI/CD upload
+      only. Example:
+      arn:aws:iam::111122223333:root,arn:aws:iam::444455556666:role/PlatformReader
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/[A-Za-z0-9+=,.@_/-]+)$"
+    ConstraintDescription: >
+      Every entry must be empty, an <account>:root ARN, or a full IAM role ARN. Wildcards are
+      not accepted anywhere in the value - not in the account field and not as the whole entry.
+
+  CicdPrincipals:
+    Type: CommaDelimitedList
+    Description: >
+      Principals granted UPLOAD/deploy access to ALL FOUR buckets, each scoped to
+      that bucket's prefix. Comma-separated IAM principal ARNs - prefer the specific
+      pipeline role ARN over <account>:root. Leave EMPTY (the default) and no CI/CD
+      statement is emitted at all. Example:
+      arn:aws:iam::111122223333:role/praimana-publish
+    Default: ""
+    AllowedPattern: "^$|^arn:aws[a-z-]*:iam::[0-9]{12}:(root|role/[A-Za-z0-9+=,.@_/-]+)$"
+    ConstraintDescription: >
+      Every entry must be empty, an <account>:root ARN, or a full IAM role ARN. Wildcards are
+      not accepted anywhere in the value - not in the account field and not as the whole entry.
+
+  EnableDeleteProtection:
+    Type: String
+    Description: >
+      Add a DenyBucketDeletion statement to every bucket policy: an explicit Deny on
+      s3:DeleteBucket for ALL principals, which no identity policy can override. Belt
+      and braces on top of DeletionPolicy: Retain - Retain only stops CloudFormation,
+      this also stops a console click or a stray CLI call. To genuinely delete a
+      bucket, redeploy with EnableDeleteProtection=false first (s3:PutBucketPolicy is
+      deliberately NOT denied, so the guard can always be lifted).
+    AllowedValues: ["true", "false"]
+    Default: "true"
+
+  CicdCanDelete:
+    Type: String
+    Description: >
+      Also grant CI/CD s3:DeleteObject, which on a versioned bucket only writes a
+      delete marker. Needed for "aws s3 sync --delete" style publishes (e.g. pruning
+      stale portal assets). s3:DeleteObjectVersion is never granted, so a pipeline
+      cannot destroy version history.
+    AllowedValues: ["true", "false"]
+    Default: "false"
+
+  ServicesBucketMode:
+    Type: String
+    Description: Manage the Lambda code-zip bucket - false | import | true.
+    AllowedValues: ["false", "import", "true"]
+    Default: "true"
+
+  ArtifactsBucketMode:
+    Type: String
+    Description: >
+      Manage the installer/artifact bucket - false | import | true. This bucket
+      PRE-EXISTS and is unmanaged, so use "import" for the IMPORT change set, then
+      "true" to attach its policy.
+    AllowedValues: ["false", "import", "true"]
+    Default: "true"
+
+  DesktopBucketMode:
+    Type: String
+    Description: Manage the desktop installer bucket - false | import | true.
+    AllowedValues: ["false", "import", "true"]
+    Default: "true"
+
+  PortalBucketMode:
+    Type: String
+    Description: Manage the portal build-output bucket - false | import | true.
+    AllowedValues: ["false", "import", "true"]
+    Default: "true"
+
+  CfTemplateBucketMode:
+    Type: String
+    Description: >
+      Manage the CloudFormation template bucket - false | import | true. This bucket is
+      NEW, so there is nothing to import: go straight to "true".
+    AllowedValues: ["false", "import", "true"]
+    Default: "true"
+
+  BucketNameSuffix:
+    Type: String
+    Description: >
+      REQUIRED unique suffix for every bucket name, e.g. "-a1b2c3d4". Must match
+      BucketNameSuffix on the pipeline stack. No default: a bucket set must never silently
+      inherit another deployment's names.
+    AllowedPattern: "^-[a-z0-9]{6,12}$"
+    ConstraintDescription: >
+      Must be a dash followed by 6-12 lowercase alphanumerics, e.g. -a1b2c3d4.
+
+  ServicesBucketName:
+    Type: String
+    Description: Lambda code-zip bucket base name (suffix appended).
+    Default: "praimana-services"
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid lowercase S3 bucket name (3-63 chars).
+
+  ArtifactsBucketName:
+    Type: String
+    Description: Installer bucket base name (suffix appended) - the .dmg/.exe customers download.
+    Default: "praimana-artifacts"
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid lowercase S3 bucket name (3-63 chars).
+
+  DesktopBucketName:
+    Type: String
+    Description: CI/CD zip drop box base name (suffix appended) - write-only, nothing reads it.
+    Default: "praimana-desktop"
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid lowercase S3 bucket name (3-63 chars).
+
+  PortalBucketName:
+    Type: String
+    Description: Portal (Next.js) build-output bucket base name (suffix appended).
+    Default: "praimana-portal"
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid lowercase S3 bucket name (3-63 chars).
+
+  CfTemplateBucketName:
+    Type: String
+    Description: >
+      CloudFormation template bucket base name (suffix appended) - holds the
+      published app tier templates (platform.yaml and the platform-*.yaml tiers) so any
+      principal in the account can deploy the platform from a URL instead of a local file.
+    Default: "praimana-cf-template"
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid lowercase S3 bucket name (3-63 chars).
+
+  AccessLogBucketName:
+    Type: String
+    Description: >
+      BASE name of the server access log target. BucketNameSuffix is appended, giving
+      <base><suffix>. MUST match AccessLogBucketName on the CI/CD pipeline's CfnExecutionRole,
+      which grants this role permission to create it.
+    Default: "praimana-access-logs"
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,48}[a-z0-9]$"
+    ConstraintDescription: >
+      Must be a valid lowercase S3 bucket name base, 3-50 chars — short enough that
+      <base><suffix> stays inside the 63-character bucket-name limit.
+
+  LambdaPrefix:
+    Type: String
+    Description: Prefix in the services bucket holding the Lambda zips.
+    Default: "lambda/"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9!_.*'()-]*(/[a-zA-Z0-9!_.*'()-]+)*/$"
+    ConstraintDescription: Must be a non-empty key prefix ending in "/".
+
+  ArtifactsPrefix:
+    Type: String
+    Description: Prefix in the artifacts bucket holding the installers (macos/, windows/ beneath).
+    Default: "desktop/"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9!_.*'()-]*(/[a-zA-Z0-9!_.*'()-]+)*/$"
+    ConstraintDescription: Must be a non-empty key prefix ending in "/".
+
+  DesktopPrefix:
+    Type: String
+    Description: Prefix in the desktop bucket that CI/CD uploads zips under.
+    Default: "desktop/"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9!_.*'()-]*(/[a-zA-Z0-9!_.*'()-]+)*/$"
+    ConstraintDescription: Must be a non-empty key prefix ending in "/".
+
+  PortalPrefix:
+    Type: String
+    Description: Prefix in the portal bucket holding the portal build bundles.
+    Default: "portal/"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9!_.*'()-]*(/[a-zA-Z0-9!_.*'()-]+)*/$"
+    ConstraintDescription: Must be a non-empty key prefix ending in "/".
+
+  CfTemplatePrefix:
+    Type: String
+    Description: >
+      Prefix in the cf-template bucket holding the published templates. Must match the
+      publishing pipeline's CfTemplatePrefix - its policy grants CI/CD upload only under
+      this prefix, so a mismatch is an AccessDenied.
+    Default: "templates/"
+    AllowedPattern: "^[a-zA-Z0-9][a-zA-Z0-9!_.*'()-]*(/[a-zA-Z0-9!_.*'()-]+)*/$"
+    ConstraintDescription: Must be a non-empty key prefix ending in "/".
+
+Conditions:
+  DeleteProtection: !Equals [!Ref EnableDeleteProtection, "true"]
+  HasCustomers: !Not [!Equals [!Join ["", !Ref CustomerPrincipals], ""]]
+  HasCicd: !Not [!Equals [!Join ["", !Ref CicdPrincipals], ""]]
+  HasCicdDelete: !And
+    - !Not [!Equals [!Join ["", !Ref CicdPrincipals], ""]]
+    - !Equals [!Ref CicdCanDelete, "true"]
+
+  WithServices: !Not [!Equals [!Ref ServicesBucketMode, "false"]]
+  WithServicesPolicy: !Equals [!Ref ServicesBucketMode, "true"]
+  WithArtifacts: !Not [!Equals [!Ref ArtifactsBucketMode, "false"]]
+  WithArtifactsPolicy: !Equals [!Ref ArtifactsBucketMode, "true"]
+  WithDesktop: !Not [!Equals [!Ref DesktopBucketMode, "false"]]
+  WithDesktopPolicy: !Equals [!Ref DesktopBucketMode, "true"]
+  WithPortal: !Not [!Equals [!Ref PortalBucketMode, "false"]]
+  WithPortalPolicy: !Equals [!Ref PortalBucketMode, "true"]
+  WithCfTemplate: !Not [!Equals [!Ref CfTemplateBucketMode, "false"]]
+  WithCfTemplatePolicy: !Equals [!Ref CfTemplateBucketMode, "true"]
+
+Resources:
+  ServicesBucket:
+    Type: AWS::S3::Bucket
+    Condition: WithServices
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ServicesBucketName}${BucketNameSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+              NewerNoncurrentVersions: 10
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: services-bucket/
+      Tags:
+        - {Key: ApplicationName, Value: !Ref ApplicationName}
+        - {Key: Environment,     Value: !Ref Environment}
+        - {Key: auto-delete,     Value: !Ref AutoDelete}
+
+  ServicesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: WithServicesPolicy
+    Properties:
+      Bucket: !Ref ServicesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ServicesBucket.Arn
+              - !Sub "${ServicesBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+          - !If
+            - DeleteProtection
+            - Sid: DenyBucketDeletion
+              Effect: Deny
+              Principal: "*"
+              Action: s3:DeleteBucket
+              Resource: !GetAtt ServicesBucket.Arn
+            - !Ref AWS::NoValue
+
+          - !If
+            - HasCustomers
+            - Sid: CustomerReadObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${ServicesBucket.Arn}/${LambdaPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCustomers
+            - Sid: CustomerListBucket
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !GetAtt ServicesBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Ref LambdaPrefix
+                    - !Sub "${LambdaPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCustomers
+            - Sid: CustomerGetBucketLocation
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action: s3:GetBucketLocation
+              Resource: !GetAtt ServicesBucket.Arn
+            - !Ref AWS::NoValue
+
+          - !If
+            - HasCicd
+            - Sid: CicdWriteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+                - s3:ListMultipartUploadParts
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${ServicesBucket.Arn}/${LambdaPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicdDelete
+            - Sid: CicdDeleteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action: s3:DeleteObject
+              Resource: !Sub "${ServicesBucket.Arn}/${LambdaPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdListBucket
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !GetAtt ServicesBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Ref LambdaPrefix
+                    - !Sub "${LambdaPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdBucketLevel
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:GetBucketLocation
+                - s3:ListBucketMultipartUploads
+              Resource: !GetAtt ServicesBucket.Arn
+            - !Ref AWS::NoValue
+
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Condition: WithArtifacts
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ArtifactsBucketName}${BucketNameSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+              NewerNoncurrentVersions: 5
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: artifacts-bucket/
+      Tags:
+        - {Key: ApplicationName, Value: !Ref ApplicationName}
+        - {Key: Environment,     Value: !Ref Environment}
+        - {Key: auto-delete,     Value: !Ref AutoDelete}
+
+  ArtifactsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: WithArtifactsPolicy
+    Properties:
+      Bucket: !Ref ArtifactsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ArtifactsBucket.Arn
+              - !Sub "${ArtifactsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+          - !If
+            - DeleteProtection
+            - Sid: DenyBucketDeletion
+              Effect: Deny
+              Principal: "*"
+              Action: s3:DeleteBucket
+              Resource: !GetAtt ArtifactsBucket.Arn
+            - !Ref AWS::NoValue
+
+          - !If
+            - HasCustomers
+            - Sid: CustomerReadObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${ArtifactsBucket.Arn}/${ArtifactsPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCustomers
+            - Sid: CustomerListBucket
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !GetAtt ArtifactsBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Ref ArtifactsPrefix
+                    - !Sub "${ArtifactsPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCustomers
+            - Sid: CustomerGetBucketLocation
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action: s3:GetBucketLocation
+              Resource: !GetAtt ArtifactsBucket.Arn
+            - !Ref AWS::NoValue
+
+          - !If
+            - HasCicd
+            - Sid: CicdWriteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+                - s3:ListMultipartUploadParts
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${ArtifactsBucket.Arn}/${ArtifactsPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicdDelete
+            - Sid: CicdDeleteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action: s3:DeleteObject
+              Resource: !Sub "${ArtifactsBucket.Arn}/${ArtifactsPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdListBucket
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !GetAtt ArtifactsBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Ref ArtifactsPrefix
+                    - !Sub "${ArtifactsPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdBucketLevel
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:GetBucketLocation
+                - s3:ListBucketMultipartUploads
+              Resource: !GetAtt ArtifactsBucket.Arn
+            - !Ref AWS::NoValue
+
+  DesktopBucket:
+    Type: AWS::S3::Bucket
+    Condition: WithDesktop
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${DesktopBucketName}${BucketNameSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+              NewerNoncurrentVersions: 5
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: desktop-bucket/
+      Tags:
+        - {Key: ApplicationName, Value: !Ref ApplicationName}
+        - {Key: Environment,     Value: !Ref Environment}
+        - {Key: auto-delete,     Value: !Ref AutoDelete}
+
+  DesktopBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: WithDesktopPolicy
+    Properties:
+      Bucket: !Ref DesktopBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DesktopBucket.Arn
+              - !Sub "${DesktopBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+          - !If
+            - DeleteProtection
+            - Sid: DenyBucketDeletion
+              Effect: Deny
+              Principal: "*"
+              Action: s3:DeleteBucket
+              Resource: !GetAtt DesktopBucket.Arn
+            - !Ref AWS::NoValue
+
+          - !If
+            - HasCicd
+            - Sid: CicdWriteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+                - s3:ListMultipartUploadParts
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${DesktopBucket.Arn}/${DesktopPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicdDelete
+            - Sid: CicdDeleteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action: s3:DeleteObject
+              Resource: !Sub "${DesktopBucket.Arn}/${DesktopPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdListBucket
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !GetAtt DesktopBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Ref DesktopPrefix
+                    - !Sub "${DesktopPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdBucketLevel
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:GetBucketLocation
+                - s3:ListBucketMultipartUploads
+              Resource: !GetAtt DesktopBucket.Arn
+            - !Ref AWS::NoValue
+
+  PortalBucket:
+    Type: AWS::S3::Bucket
+    Condition: WithPortal
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${PortalBucketName}${BucketNameSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+              NewerNoncurrentVersions: 5
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: portal-bucket/
+      Tags:
+        - {Key: ApplicationName, Value: !Ref ApplicationName}
+        - {Key: Environment,     Value: !Ref Environment}
+        - {Key: auto-delete,     Value: !Ref AutoDelete}
+
+  PortalBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: WithPortalPolicy
+    Properties:
+      Bucket: !Ref PortalBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt PortalBucket.Arn
+              - !Sub "${PortalBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+          - !If
+            - DeleteProtection
+            - Sid: DenyBucketDeletion
+              Effect: Deny
+              Principal: "*"
+              Action: s3:DeleteBucket
+              Resource: !GetAtt PortalBucket.Arn
+            - !Ref AWS::NoValue
+
+          - !If
+            - HasCustomers
+            - Sid: CustomerReadObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${PortalBucket.Arn}/${PortalPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCustomers
+            - Sid: CustomerListBucket
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !GetAtt PortalBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Ref PortalPrefix
+                    - !Sub "${PortalPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCustomers
+            - Sid: CustomerGetBucketLocation
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action: s3:GetBucketLocation
+              Resource: !GetAtt PortalBucket.Arn
+            - !Ref AWS::NoValue
+
+          - !If
+            - HasCicd
+            - Sid: CicdWriteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+                - s3:ListMultipartUploadParts
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${PortalBucket.Arn}/${PortalPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicdDelete
+            - Sid: CicdDeleteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action: s3:DeleteObject
+              Resource: !Sub "${PortalBucket.Arn}/${PortalPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdListBucket
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !GetAtt PortalBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Ref PortalPrefix
+                    - !Sub "${PortalPrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdBucketLevel
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:GetBucketLocation
+                - s3:ListBucketMultipartUploads
+              Resource: !GetAtt PortalBucket.Arn
+            - !Ref AWS::NoValue
+
+  CfTemplateBucket:
+    Type: AWS::S3::Bucket
+    Condition: WithCfTemplate
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${CfTemplateBucketName}${BucketNameSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+              NewerNoncurrentVersions: 30
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: cf-template-bucket/
+      Tags:
+        - {Key: ApplicationName, Value: !Ref ApplicationName}
+        - {Key: Environment,     Value: !Ref Environment}
+        - {Key: auto-delete,     Value: !Ref AutoDelete}
+
+  CfTemplateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: WithCfTemplatePolicy
+    Properties:
+      Bucket: !Ref CfTemplateBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CfTemplateBucket.Arn
+              - !Sub "${CfTemplateBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+          - !If
+            - DeleteProtection
+            - Sid: DenyBucketDeletion
+              Effect: Deny
+              Principal: "*"
+              Action: s3:DeleteBucket
+              Resource: !GetAtt CfTemplateBucket.Arn
+            - !Ref AWS::NoValue
+
+          - !If
+            - HasCustomers
+            - Sid: CustomerReadObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${CfTemplateBucket.Arn}/${CfTemplatePrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCustomers
+            - Sid: CustomerListBucket
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !GetAtt CfTemplateBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Ref CfTemplatePrefix
+                    - !Sub "${CfTemplatePrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCustomers
+            - Sid: CustomerGetBucketLocation
+              Effect: Allow
+              Principal:
+                AWS: !Ref CustomerPrincipals
+              Action: s3:GetBucketLocation
+              Resource: !GetAtt CfTemplateBucket.Arn
+            - !Ref AWS::NoValue
+
+          - !If
+            - HasCicd
+            - Sid: CicdWriteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:PutObject
+                - s3:AbortMultipartUpload
+                - s3:ListMultipartUploadParts
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Resource: !Sub "${CfTemplateBucket.Arn}/${CfTemplatePrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicdDelete
+            - Sid: CicdDeleteObjects
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action: s3:DeleteObject
+              Resource: !Sub "${CfTemplateBucket.Arn}/${CfTemplatePrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdListBucket
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:ListBucket
+                - s3:ListBucketVersions
+              Resource: !GetAtt CfTemplateBucket.Arn
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Ref CfTemplatePrefix
+                    - !Sub "${CfTemplatePrefix}*"
+            - !Ref AWS::NoValue
+          - !If
+            - HasCicd
+            - Sid: CicdBucketLevel
+              Effect: Allow
+              Principal:
+                AWS: !Ref CicdPrincipals
+              Action:
+                - s3:GetBucketLocation
+                - s3:ListBucketMultipartUploads
+              Resource: !GetAtt CfTemplateBucket.Arn
+            - !Ref AWS::NoValue
+
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: >-
+              This bucket IS the log-delivery target. Self-logging recurses unboundedly.
+              Cross-pointing was evaluated and is blocked by S3's
+              same-account-and-Region requirement for server access logging across this
+              platform.
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: >-
+              This bucket IS the log-delivery target for the platform's other buckets.
+              Self-logging recurses: every delivered log object is itself an event to be logged.
+              Residual stated openly - reads of the access logs are not themselves audited; if
+              that is required the answer is CloudTrail data events, not self-referential S3
+              logging.
+    Properties:
+      BucketName: !Sub "${AccessLogBucketName}${BucketNameSuffix}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+          - Id: CleanExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+          - Id: AbortIncompleteUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - {Key: ApplicationName, Value: !Ref ApplicationName}
+        - {Key: Environment,     Value: !Ref Environment}
+        - {Key: auto-delete,     Value: !Ref AutoDelete}
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AccessLogBucket.Arn
+              - !Sub "${AccessLogBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - !If
+            - DeleteProtection
+            - Sid: DenyBucketDeletion
+              Effect: Deny
+              Principal: "*"
+              Action: s3:DeleteBucket
+              Resource: !GetAtt AccessLogBucket.Arn
+            - !Ref AWS::NoValue
+          - !If
+            - WithServices
+            - Sid: AllowS3LogDeliveryServices
+              Effect: Allow
+              Principal: {Service: logging.s3.amazonaws.com}
+              Action: s3:PutObject
+              Resource: !Sub "${AccessLogBucket.Arn}/services-bucket/*"
+              Condition:
+                StringEquals:
+                  aws:SourceAccount: !Ref "AWS::AccountId"
+                ArnLike:
+                  aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${ServicesBucketName}${BucketNameSuffix}"
+            - !Ref AWS::NoValue
+          - !If
+            - WithArtifacts
+            - Sid: AllowS3LogDeliveryArtifacts
+              Effect: Allow
+              Principal: {Service: logging.s3.amazonaws.com}
+              Action: s3:PutObject
+              Resource: !Sub "${AccessLogBucket.Arn}/artifacts-bucket/*"
+              Condition:
+                StringEquals:
+                  aws:SourceAccount: !Ref "AWS::AccountId"
+                ArnLike:
+                  aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${ArtifactsBucketName}${BucketNameSuffix}"
+            - !Ref AWS::NoValue
+          - !If
+            - WithDesktop
+            - Sid: AllowS3LogDeliveryDesktop
+              Effect: Allow
+              Principal: {Service: logging.s3.amazonaws.com}
+              Action: s3:PutObject
+              Resource: !Sub "${AccessLogBucket.Arn}/desktop-bucket/*"
+              Condition:
+                StringEquals:
+                  aws:SourceAccount: !Ref "AWS::AccountId"
+                ArnLike:
+                  aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${DesktopBucketName}${BucketNameSuffix}"
+            - !Ref AWS::NoValue
+          - !If
+            - WithPortal
+            - Sid: AllowS3LogDeliveryPortal
+              Effect: Allow
+              Principal: {Service: logging.s3.amazonaws.com}
+              Action: s3:PutObject
+              Resource: !Sub "${AccessLogBucket.Arn}/portal-bucket/*"
+              Condition:
+                StringEquals:
+                  aws:SourceAccount: !Ref "AWS::AccountId"
+                ArnLike:
+                  aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${PortalBucketName}${BucketNameSuffix}"
+            - !Ref AWS::NoValue
+          - !If
+            - WithCfTemplate
+            - Sid: AllowS3LogDeliveryCfTemplate
+              Effect: Allow
+              Principal: {Service: logging.s3.amazonaws.com}
+              Action: s3:PutObject
+              Resource: !Sub "${AccessLogBucket.Arn}/cf-template-bucket/*"
+              Condition:
+                StringEquals:
+                  aws:SourceAccount: !Ref "AWS::AccountId"
+                ArnLike:
+                  aws:SourceArn: !Sub "arn:${AWS::Partition}:s3:::${CfTemplateBucketName}${BucketNameSuffix}"
+            - !Ref AWS::NoValue
+
+Outputs:
+  ServicesBucketNameOut:
+    Condition: WithServices
+    Description: Lambda code-zip bucket. Pass to the platform deploy as ServicesBucket.
+    Value: !Ref ServicesBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-services-bucket-name"
+
+  ServicesBucketArn:
+    Condition: WithServices
+    Description: ARN of the Lambda code-zip bucket.
+    Value: !GetAtt ServicesBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-services-bucket-arn"
+
+  ArtifactsBucketNameOut:
+    Condition: WithArtifacts
+    Description: Installer/artifact bucket. Pass to the platform deploy as DesktopBucket.
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-artifacts-bucket-name"
+
+  ArtifactsBucketArn:
+    Condition: WithArtifacts
+    Description: ARN of the installer/artifact bucket.
+    Value: !GetAtt ArtifactsBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-artifacts-bucket-arn"
+
+  DesktopBucketNameOut:
+    Condition: WithDesktop
+    Description: Desktop installer bucket (new).
+    Value: !Ref DesktopBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-desktop-bucket-name"
+
+  DesktopBucketArn:
+    Condition: WithDesktop
+    Description: ARN of the desktop installer bucket.
+    Value: !GetAtt DesktopBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-desktop-bucket-arn"
+
+  PortalBucketNameOut:
+    Condition: WithPortal
+    Description: Portal build-output bucket (new).
+    Value: !Ref PortalBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-portal-bucket-name"
+
+  PortalBucketArn:
+    Condition: WithPortal
+    Description: ARN of the portal build-output bucket.
+    Value: !GetAtt PortalBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-portal-bucket-arn"
+
+  CfTemplateBucketNameOut:
+    Condition: WithCfTemplate
+    Description: >
+      CloudFormation template bucket (new). The app tier templates are published here
+      (infra/aws/app/buildspec-publish.yml, or by hand per infra/SETUP.md step 2.0); a deploy
+      reads the platform.yaml master from this bucket by URL.
+    Value: !Ref CfTemplateBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-cf-template-bucket-name"
+
+  CfTemplateBucketArn:
+    Condition: WithCfTemplate
+    Description: ARN of the CloudFormation template bucket.
+    Value: !GetAtt CfTemplateBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-cf-template-bucket-arn"
+
+  CfTemplateUrlPattern:
+    Condition: WithCfTemplate
+    Description: >
+      What a deploy passes to --template-url for the platform.yaml master. MUST be the
+      https:// form - create-stack rejects an s3:// URL for --template-url - and the bucket
+      must be in the SAME REGION as the stack being created. The master's TemplateBucket and
+      TemplatePrefix parameters must name this same bucket and prefix.
+    Value: !Sub "https://${CfTemplateBucketName}${BucketNameSuffix}.s3.${AWS::Region}.amazonaws.com/${CfTemplatePrefix}platform.yaml"
+
+  Prefixes:
+    Description: Key prefixes read access is scoped to (services|artifacts|desktop|portal|cf-template).
+    Value: !Sub "${LambdaPrefix}|${ArtifactsPrefix}|${DesktopPrefix}|${PortalPrefix}|${CfTemplatePrefix}"

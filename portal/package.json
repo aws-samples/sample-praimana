@@ -1,0 +1,52 @@
+{
+  "name": "praimana-portal",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT-0",
+  "description": "Praimana \u2014 the web portal: facilitator and admin screens, the participant experience, and the BFF that fronts the backend services.",
+  "packageManager": "pnpm@10.30.3",
+  "scripts": {
+    "dev": "next dev --port 3001",
+    "build": "next build",
+    "start": "next start --port 3001",
+    "lint": "eslint src/ shared/",
+    "type-check": "tsc --noEmit",
+    "test": "LC_ALL=en_GB.UTF-8 LANG=en_GB.UTF-8 vitest run",
+    "test:watch": "LC_ALL=en_GB.UTF-8 LANG=en_GB.UTF-8 vitest",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@tanstack/react-query": "5.101.4",
+    "@trpc/client": "11.18.0",
+    "@trpc/react-query": "11.18.0",
+    "@trpc/server": "11.18.0",
+    "aws-amplify": "6.20.0",
+    "jose": "6.2.9",
+    "next": "15.5.28",
+    "next-auth": "5.0.0-beta.32",
+    "qrcode": "1.5.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "react-markdown": "9.1.0",
+    "superjson": "2.2.6",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.5",
+    "@next/eslint-plugin-next": "15.5.23",
+    "@playwright/test": "1.62.1",
+    "@tailwindcss/typography": "0.5.20",
+    "@types/node": "22.20.1",
+    "@types/qrcode": "1.5.6",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "autoprefixer": "10.5.4",
+    "eslint": "9.39.5",
+    "eslint-plugin-react-hooks": "7.1.1",
+    "postcss": "8.5.26",
+    "tailwindcss": "3.4.19",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.67.0",
+    "vitest": "4.1.12"
+  }
+}

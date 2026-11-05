@@ -1,0 +1,28 @@
+{
+  "deployment": {
+    "awsProfile": "",
+    "awsRegion": "us-east-1",
+    "expectedAccountId": "123456789012",
+    "dnsProfile": "",
+    "hostedZoneId": "",
+    "adminEmail": "admin@example.com",
+    "runChecks": "true"
+  },
+  "parameters": {
+    "Environment": "dev",
+    "PortalDomainName": "portal.example.com",
+    "ApiDomainName": "api.portal.example.com",
+    "CognitoDomainPrefix": "my-praimana-dev",
+    "ReleaseVersion": "1.0.0",
+    "PortalReleaseVersion": "1.0.0",
+    "KeyAdministratorArn": "",
+    "LogRetentionInDays": "30",
+    "EnablePortalWaf": "true",
+    "EnableCanary": "true",
+    "AlertEmail": "alerts@example.com",
+    "SesIdentityName": "sender@example.com",
+    "SesIdentityType": "EmailAddress",
+    "SesUseExistingIdentity": "true",
+    "EmailReplyTo": "sender@example.com"
+  }
+}

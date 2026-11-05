@@ -1,0 +1,55 @@
+{
+  "compilerOptions": {
+    /**
+     * ⚠ NO `extends`. The twelve options below are inlined rather than extended from a base config. A
+     * standalone repo with a
+     * dangling `extends` fails at `tsc` startup with TS5083 before it type-checks a single file.
+     */
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "resolveJsonModule": true,
+    "allowJs": true,
+    "strict": true,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "isolatedModules": true,
+    "incremental": true,
+
+    "plugins": [{ "name": "next" }],
+    "jsx": "preserve",
+
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      /**
+       * ⚠ THE VENDORED SHARED CODE, ALIASED RATHER THAN REWRITTEN. `@praimana/shared` was a
+       * `workspace:*` dependency; ~60 files import it by that specifier. Aliasing here keeps every one of
+       * those import statements unchanged — see README, "Vendored shared code".
+       *
+       * ⚠ NEXT READS THIS FILE'S `paths` AND CONFIGURES ITS BUNDLER FROM IT, so the alias holds at build
+       * and runtime as well as in the type checker. That is why `next.config.ts` needs no webpack alias,
+       * and why removing this line breaks `next build` and not just `tsc`.
+       */
+      "@praimana/shared": ["./shared/index.ts"]
+    }
+  },
+  // `shared` and `tests` are listed explicitly. The repo-wide TS glob below already reaches them, but being
+  // explicit is what stops a future narrowing of `include` to `src` from silently dropping the vendored code
+  // out of the type check — the failure the desktop's tsconfig records as TS6059.
+  //
+  // (Written as line comments on purpose: a glob like the one above contains the block-comment terminator,
+  // so spelling it inside one truncates the comment and makes this file unparseable. It did, once.)
+  "include": [
+    "next-env.d.ts",
+    "**/*.ts",
+    "**/*.tsx",
+    "shared/**/*.ts",
+    "tests/**/*.ts",
+    ".next/types/**/*.ts"
+  ],
+  "exclude": ["node_modules", ".next"]
+}

@@ -1,0 +1,55 @@
+# ⚠ THIS FILE HOLDS PNPM SETTINGS, NOT A WORKSPACE: `onlyBuiltDependencies`, the security `overrides`
+# and `auditConfig`.
+#
+# pnpm 10 reads `onlyBuiltDependencies` ONLY from pnpm-workspace.yaml — putting it in package.json logs
+# "This will not take effect" and silently skips those packages' install scripts. Skipped, electron never
+# downloads its binary and better-sqlite3 never builds, so `pnpm package` fails on a repo that installed
+# without error.
+#
+# Prisma is deliberately not listed: this app does not use it.
+onlyBuiltDependencies:
+  # ⚠ better-sqlite3 IS DELIBERATELY ABSENT FROM THIS LIST.
+  #
+  # It was here from the 11.x era, when the package shipped per-ABI binaries via
+  # prebuild-install and building on install had real work to do. better-sqlite3 13 is a
+  # Node-API addon published with prebuildify: node_modules/better-sqlite3/prebuilds/
+  # <platform>-<arch>.node, ABI-stable across runtimes, so the shipped binary is already
+  # correct. scripts/rebuild-native.sh explains this at length and verifies it.
+  #
+  # 13.0.3 declares NO install script - but it does ship a binding.gyp, and npm/pnpm run
+  # `node-gyp rebuild` IMPLICITLY for any package that has one and defines no install
+  # script. So allowing its build scripts here is enough to trigger a full source compile
+  # of a module whose prebuilt binary is sitting right there.
+  #
+  # Listing it forced `node-gyp rebuild`, which BROKE THE WINDOWS BUILD: the CodeBuild
+  # Windows image has VS BuildTools shells but no VC++ toolset, so the compile failed with
+  #     gyp ERR! find VS - missing any VC++ toolset
+  # for a binary that was already present and correct in the tarball.
+  #
+  # If a future bump reverts to a per-ABI addon, rebuild-native.sh is the thing that
+  # catches it - the Vitest suite cannot, because it mocks better-sqlite3 and passes
+  # under either ABI.
+  - electron
+  - esbuild
+
+# Moved from package.json, whose "pnpm" field pnpm 11 no longer reads.
+# Security pins for transitive dependencies. Changing one changes pnpm-lock.yaml.
+overrides:
+  "js-yaml": "4.3.2"
+  "@xmldom/xmldom": "0.9.12"
+  "fast-uri": "3.1.8"
+  "hono": "4.13.11"
+  "undici": "7.29.1"
+  "qs": "6.16.0"
+  "ip-address": "10.7.4"
+  "proxy-addr": "2.0.8"
+  "@modelcontextprotocol/sdk": "1.32.0"
+  "source-map-js": "1.2.2"
+  "postcss": "8.5.26"
+  "brace-expansion@1": "1.1.21"
+  "brace-expansion@2": "2.1.7"
+  "brace-expansion@>=4": "5.0.12"
+# Each ignored advisory is justified in README.md ("Dependency audit exception").
+auditConfig:
+  ignoreGhsas:
+    - "GHSA-ch52-4w7c-c8xp"

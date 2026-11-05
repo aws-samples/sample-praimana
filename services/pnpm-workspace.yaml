@@ -1,0 +1,57 @@
+packages:  # nosemgrep: pnpm-block-exotic-sub-dependencies,pnpm-minimum-release-age,pnpm-trust-policy
+  - "shared"
+  - "service-shared"
+  - "ai"
+  - "bulk-provision"
+  - "cognito-postconfirmation"
+  - "cognito-presignup"
+  - "collaboration"
+  - "desktop"
+  - "docs"
+  - "evaluation"
+  - "identity"
+  - "notify"
+  - "source"
+  - "team"
+  - "user-access"
+  - "user-projection"
+  - "workshop"
+# ⚠ `false` IS THE WORKING ANSWER HERE, AND `true` BREAKS EVERY BUILD. COUNTER-INTUITIVE, SO:
+#
+# pnpm blocks dependency build scripts by default and, on the first install that hits one, appends this
+# key as the placeholder `esbuild: set this to true or false`. Answering `true` looks obviously right —
+# esbuild ships a native binary, surely it needs its postinstall. It does not, and it must not have it:
+#
+#   - esbuild's `bin/esbuild` is a JS SHIM that spawns the real binary out of the platform package
+#     (`@esbuild/darwin-arm64` and friends). Those are ordinary dependencies with no build step, so
+#     pnpm installs them regardless and the shim works untouched. This is the path that works.
+#   - esbuild's postinstall is an OPTIMISATION: it overwrites that JS shim with the Mach-O/ELF binary
+#     to save the shim's process spawn. But pnpm has already linked `node_modules/.bin/esbuild` as a
+#     wrapper that runs `exec node .../esbuild/bin/esbuild` — and once postinstall has swapped the file,
+#     Node is handed a Mach-O and every one of the 14 services' builds dies with:
+#
+#         .../esbuild/bin/esbuild:1
+#         <binary bytes>
+#         SyntaxError: Invalid or unexpected token
+#
+#     The shim is linked BEFORE postinstall runs, so allowing the build guarantees a stale wrapper.
+#
+# So the `ERR_PNPM_IGNORED_BUILDS` warning on a fresh install is NOISE for this dependency, not a
+# defect. `false` records that decision so pnpm stops asking and the placeholder is never answered the
+# other way by someone reading the warning literally. Verified both ways: `true` → 14 builds fail,
+# `false` → 14 builds pass.
+#
+# (The monorepo listed esbuild under the older `onlyBuiltDependencies:` key and got away with it because
+# nothing there invoked the `.bin` wrapper on a hoisted node-linker the way these services do.)
+allowBuilds:
+  esbuild: false
+
+# Moved from package.json, whose "pnpm" field pnpm 11 no longer reads.
+# Security pins for transitive dependencies. Changing one changes pnpm-lock.yaml.
+overrides:
+  "js-yaml": "4.3.2"
+  "hono": "4.13.11"
+  "source-map-js": "1.2.2"
+  "brace-expansion@1": "1.1.21"
+  "brace-expansion@>=4": "5.0.12"
+  "vite": "7.3.7"

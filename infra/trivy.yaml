@@ -1,0 +1,2 @@
+# Loaded automatically by trivy when run from infra/. Same ignore file as the repository root.
+ignorefile: ../.trivyignore.yaml

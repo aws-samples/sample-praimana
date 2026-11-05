@@ -1,0 +1,482 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Praimana - the App-account identity tier: Cognito user pool, app client,
+  hosted-UI domain, five role groups, and the two Cognito trigger Lambdas with their execution
+  role. The trigger functions are here rather than in the compute tier because UserPool and
+  they form a dependency cycle that only holds inside a single stack.
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 15
+    Tracing: Active
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+        ENVIRONMENT: !Ref Environment
+        EVENT_BUS_NAME: praimana-events
+        EAST_WEST_TIMEOUT_MS: !Ref EastWestTimeoutMs
+    Tags:
+      ApplicationName: Praimana
+      Environment: !Ref Environment
+
+Parameters:
+  KmsKeyArn:
+    Type: String
+    Description: >
+      ARN of the customer-managed KMS key from platform-kms.yaml (tier 0). REQUIRED, no
+      default. Enables a customer-managed KMS key for encryption at rest.
+
+      ⚠ REQUIRED RATHER THAN OPTIONAL ON PURPOSE. An optional key would mean wrapping every
+      encryption property in an Fn::If, and neither cfn_nag nor checkov can resolve an
+      intrinsic - the findings this exists to clear would stay open, exactly as W73 did for
+      the BillingMode parameter. A required parameter is the only shape that both encrypts
+      and closes the finding.
+
+      ⚠ Pass the full ARN, not a key id and not an alias: an alias can be repointed at a
+      different key without this stack changing.
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+$"
+    ConstraintDescription: Must be a full KMS key ARN from the tier-0 KMS stack.
+
+  Environment:
+    Type: String
+    Description: >
+      Environment tag applied to every taggable resource here. REQUIRED, no default - a wrong
+      environment tag silently corrupts cost allocation.
+    AllowedValues: ["dev", "test", "staging", "prod", "shared"]
+
+  CognitoCallbackUrls:
+    Type: CommaDelimitedList
+    Description: >
+      Allowed OAuth2 callback URLs for the hosted UI. REQUIRED and deliberately without a
+      default: a redirect URI is where Cognito hands over a token, so it is not a value to
+      inherit. Revisable later with no interruption - see the header. Cognito accepts http://
+      only for localhost, 127.0.0.1 and [::1].
+
+  CognitoLogoutUrls:
+    Type: CommaDelimitedList
+    Description: >
+      Allowed sign-out redirect URLs. REQUIRED for the same reason as CognitoCallbackUrls, and
+      revisable in the same way.
+
+  CognitoDomainPrefix:
+    Type: String
+    Description: >
+      REQUIRED. Prefix for the hosted-UI domain, <prefix>.auth.<region>.amazoncognito.com. GLOBALLY
+      UNIQUE across all AWS accounts, so it behaves like an S3 bucket name, and it must not contain
+      "aws", "amazon" or "cognito". Both front ends sign in through the hosted UI, so there is no
+      empty setting, and no account-id fallback that would publish the account id in a public URL.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+    ConstraintDescription: Required. Lowercase alphanumerics and dashes.
+
+  EmailFrom:
+    Type: String
+    Description: >
+      Sender for Cognito's own mail. ⚠ ONLY SET THIS IF THE SES IDENTITY IS A DOMAIN - the
+      SourceArn is derived from the domain half of this address, so an address-only identity
+      makes it point at nothing. EMPTY uses Cognito's default email service. See the header.
+    Default: ""
+
+  EmailReplyTo:
+    Type: String
+    Description: Reply-To for Cognito's mail. Needs no SES verification of its own.
+    Default: ""
+
+  LogRetentionInDays:
+    Type: String
+    Description: Retention for the two trigger functions' log groups. "0" means never expire.
+    Default: "30"
+    AllowedValues: ["0","1","3","5","7","14","30","60","90","120","150","180","365","400","545","731","1096","1827","3653"]
+
+  ReleaseVersion:
+    Type: String
+    Description: >
+      Release whose Lambda zips the triggers are deployed from, as published by
+      services/buildspec-publish.yml. BARE SEMVER - the services package.json version
+      verbatim, the same string platform-api.yaml and platform-portal.yaml take.
+
+      ⚠ THE "v" IN THE S3 KEY IS NOT PART OF THIS VALUE. The publisher writes to
+      lambda/v<version>/, so the two CodeUri keys below prefix a literal "v" themselves.
+      Every tier taking a release version must use the same bare form, or one release ends
+      up with two spellings across tiers.
+    Default: "1.0.0"
+    AllowedPattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    ConstraintDescription: must look like 0.0.1 (<major>.<minor>.<patch>), with no leading "v"
+
+  EastWestTimeoutMs:
+    Type: Number
+    Default: 2500
+    MinValue: 200
+    MaxValue: 10000
+    Description: >-
+      Per-attempt deadline, in milliseconds, for a service-to-service HTTP call
+      (the authorization probes between team/workshop/collaboration/evaluation/
+      source/ai). Applied to every function via Globals.
+
+      RAISED FROM 800 AFTER A FAILED PROBE: a facilitator who owned a workshop was told
+      "only the workshop owner can create teams". The probe was
+      timing out and the fail-closed catch reported "not the owner" — an
+      authorization FAILURE rendered as an authorization ANSWER. Measured from a
+      Lambda in the same subnets: 1802ms on a cold environment's first call (ENI/DNS
+      to the execute-api PrivateLink endpoint plus TLS), then 46-125ms warm. The
+      default is that 1802ms plus ~40% headroom.
+
+      LOWERING THIS BELOW ~1800 REINTRODUCED THAT BUG while the services ran in a VPC,
+      where the PrivateLink first call cost ~1.8s. The functions now run outside a VPC, so a
+      lower value is legitimate if you measure your own first-call cost. The service code warns on a value at or below the
+      measured cost rather than refusing it, for exactly that case.
+
+      MaxValue is 10000 because the point of the timeout is that a hung dependency
+      cannot hold a Lambda: functions time out at 15s and the gateway at 29s, so a
+      larger value would restore the unbounded wait while looking configured. The
+      service code independently clamps to the same 200..10000 range and falls back
+      to its compiled default if this is malformed — a stack parameter and a bundled
+      constant can disagree, so neither is trusted alone.
+
+  ServicesBucket:
+    Type: String
+    Description: >
+      REQUIRED. Your Lambda zip bucket (praimana-services<BucketNameSuffix> from
+      infra/aws/shared/platform-buckets.yaml); a wrong value fails loudly at code fetch rather
+      than silently. No default: the shared stack always appends a suffix, so an unsuffixed
+      default never names a real bucket.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid S3 bucket name.
+
+Conditions:
+  HasEmailFrom: !Not [!Equals [!Ref EmailFrom, ""]]
+  HasEmailReplyTo: !Not [!Equals [!Ref EmailReplyTo, ""]]
+  LogsNeverExpire: !Equals [!Ref LogRetentionInDays, "0"]
+
+Resources:
+  KmsUsePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Data-plane use of the platform CMK. No administrative actions.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: UsePlatformKey
+            Effect: Allow
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: !Ref KmsKeyArn
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub
+        - "praimana-${Env}"
+        - Env: !Ref Environment
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      MfaConfiguration: "ON"
+      EnabledMfas: !If
+        - HasEmailFrom
+        - [SOFTWARE_TOKEN_MFA, EMAIL_OTP]
+        - [SOFTWARE_TOKEN_MFA]
+      EmailConfiguration: !If
+        - HasEmailFrom
+        - EmailSendingAccount: DEVELOPER
+          From: !Ref EmailFrom
+          SourceArn: !Sub
+            - "arn:${AWS::Partition}:ses:${AWS::Region}:${AWS::AccountId}:identity/${Domain}"
+            - Domain: !Select [1, !Split ["@", !Ref EmailFrom]]
+          ReplyToEmailAddress: !If [HasEmailReplyTo, !Ref EmailReplyTo, !Ref "AWS::NoValue"]
+        - !Ref "AWS::NoValue"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - !If
+            - HasEmailFrom
+            - { Name: admin_only, Priority: 1 }
+            - { Name: verified_email, Priority: 1 }
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Schema:
+        - { Name: email, AttributeDataType: String, Required: true, Mutable: true }
+        - { Name: name, AttributeDataType: String, Required: false, Mutable: true }
+        - { Name: organization, AttributeDataType: String, Required: false, Mutable: true }
+      LambdaConfig:
+        PreSignUp: !GetAtt CognitoPreSignupFunction.Arn
+        PostConfirmation: !GetAtt CognitoPostConfirmationFunction.Arn
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub
+        - "praimana-${Env}-web"
+        - Env: !Ref Environment
+      GenerateSecret: false
+      AllowedOAuthFlows: [code]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [openid, email, profile]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs: !Ref CognitoCallbackUrls
+      LogoutURLs: !Ref CognitoLogoutUrls
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 30
+      IdTokenValidity: 30
+      RefreshTokenValidity: 30
+      TokenValidityUnits: { AccessToken: minutes, IdToken: minutes, RefreshToken: days }
+      PreventUserExistenceErrors: ENABLED
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref CognitoDomainPrefix
+
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: ADMIN, UserPoolId: !Ref UserPool, Precedence: 0, Description: Platform administrators }
+
+  FacilitatorGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: FACILITATOR, UserPoolId: !Ref UserPool, Precedence: 1, Description: Workshop facilitators }
+
+  JudgeGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: JUDGE, UserPoolId: !Ref UserPool, Precedence: 2, Description: Submission judges }
+
+  ExecutiveGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: EXECUTIVE, UserPoolId: !Ref UserPool, Precedence: 3, Description: Executive viewers }
+
+  ParticipantGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties: { GroupName: PARTICIPANT, UserPoolId: !Ref UserPool, Precedence: 4, Description: Workshop participants }
+
+  CognitoTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoTriggerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-users"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-users/index/*"
+
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-invitations"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-invitations/index/*"
+
+              - Effect: Deny
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-invitations"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-invitations/index/*"
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/praimana-events"
+
+  CognitoTriggerGroupPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CognitoTriggerGroupAccess
+      Roles:
+        - !Ref CognitoTriggerRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: cognito-idp:AdminAddUserToGroup
+            Resource: !GetAtt UserPool.Arn
+
+  CognitoPresignupLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/cognito-presignup
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  CognitoPostconfirmationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/cognito-postconfirmation
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  CognitoPreSignupFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-cognito-presignup
+      Description: Cognito pre-signup trigger. Gates sign-up to invited emails (invite-only) by reading the invitation straight from DynamoDB.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/cognito-presignup/cognito-presignup.zip"
+      Handler: handler.handler
+      Role: !GetAtt CognitoTriggerRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref CognitoPresignupLogGroup
+      Environment:
+        Variables:
+          TABLE_INVITATIONS: praimana-invitations
+
+  CognitoPostConfirmationFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+      cfn-lint: { config: { ignore_checks: [W1030] } }
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-cognito-postconfirmation
+      Description: Cognito post-confirmation trigger. Creates the user profile, assigns the Cognito group, and joins the invited team/event after a confirmed sign-up.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/cognito-postconfirmation/cognito-postconfirmation.zip"
+      Handler: handler.handler
+      Role: !GetAtt CognitoTriggerRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref CognitoPostconfirmationLogGroup
+      Environment:
+        Variables:
+          TABLE_USERS: praimana-users
+          TABLE_INVITATIONS: praimana-invitations
+
+  CognitoPreSignupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CognitoPreSignupFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  CognitoPostConfirmationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref CognitoPostConfirmationFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+Outputs:
+  UserPoolId:
+    Description: User pool id. The compute tier's JWT authorizer issuer is derived from it.
+    Value: !Ref UserPool
+
+  UserPoolArn:
+    Description: User pool ARN.
+    Value: !GetAtt UserPool.Arn
+
+  UserPoolClientId:
+    Description: >
+      App client id, and the JWT audience. Stable across a callback-URL revision, which is what
+      makes the two-pass safe.
+    Value: !Ref UserPoolClient
+
+  CognitoIssuerUrl:
+    Description: OIDC issuer, for the compute tier's COGNITO_ISSUER.
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+
+  HostedUiDomain:
+    Description: Hosted-UI domain. Sign-in is not possible without one.
+    Value: !Sub "${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"

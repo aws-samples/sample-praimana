@@ -1,0 +1,30 @@
+# Gate for the praimana-desktop-publish pipeline. Cheap Linux compute, no publishing.
+#
+# This is a SEPARATE PIPELINE STAGE rather than a step inside the platform builds, and that
+# is the whole point: actions within one stage run in parallel and do not gate each other,
+# so a type error found by the Linux project would not stop the macOS and Windows projects
+# from building and publishing. A stage boundary does gate them.
+#
+# Ordering it first also means a broken commit costs one Linux build-minute instead of time
+# on a reserved-capacity macOS fleet, which bills continuously.
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 22
+    commands:
+      - corepack enable
+      - corepack prepare "$(node -p "require('./package.json').packageManager")" --activate
+
+  build:
+    commands:
+      - pnpm install --frozen-lockfile
+      - pnpm audit --audit-level=high
+      - pnpm run type-check
+      - pnpm run lint
+      - pnpm run test
+      # Electron is not launched here and the native module is not exercised on this
+      # platform - rebuild-native belongs to the platform builds, which run on the OS whose
+      # prebuild they actually load.
+      - echo "gate passed - platform builds may proceed"

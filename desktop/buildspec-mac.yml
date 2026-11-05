@@ -1,0 +1,219 @@
+# Build the macOS UNIVERSAL installer and publish it to the `artifacts` bucket.
+#
+# Runs on a CodeBuild macOS RESERVED-CAPACITY FLEET (Apple silicon, arm64) — there is no
+# on-demand macOS compute. The fleet bills continuously while provisioned, not per build.
+#
+# UNIVERSAL FROM AN arm64 HOST IS FINE. @electron/universal downloads both Electron slices
+# and lipos them, so no x64 machine is needed. better-sqlite3 ships darwin-arm64 AND
+# darwin-x64 prebuilds in the same tarball, so the native files are byte-identical between
+# the two app copies — the case universal merging handles cleanly rather than erroring on
+# differing binaries.
+#
+# ── ⚠ THIS PRODUCES AN UNSIGNED, UN-NOTARIZED dmg ──────────────────────────────────────────
+#
+# This sample ships WITHOUT code signing. The consequence is not cosmetic: Gatekeeper blocks
+# an unsigned download. Users see "can't be opened because Apple cannot check it for malicious
+# software" and must right-click -> Open, or run `xattr -dr com.apple.quarantine <app>`, per
+# machine.
+#
+# TO SIGN AND NOTARIZE WITH YOUR OWN APPLE DEVELOPER ID, use electron-builder's built-in
+# support — no changes to this buildspec's structure are required. In short:
+#   * Provide your Developer ID Application certificate via CSC_LINK (a base64 .p12 or a path)
+#     and CSC_KEY_PASSWORD, so electron-builder signs the app and dmg with `codesign`.
+#   * Set `mac.notarize` back to a truthy value in package.json (it is `false` here) and supply
+#     Apple notarization credentials — an App Store Connect API key
+#     (APPLE_API_KEY / APPLE_API_KEY_ID / APPLE_API_ISSUER) or an Apple ID
+#     (APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID).
+# See the electron-builder "Code Signing" and "Notarization" documentation for the current
+# environment-variable names and options.
+#
+# The unsigned path is made EXPLICIT rather than left to fallback behaviour:
+#   * CSC_IDENTITY_AUTO_DISCOVERY=false stops electron-builder hunting the keychain and
+#     failing on an ambiguous or absent identity.
+#   * hardenedRuntime stays true in package.json; it is meaningless without a signature but
+#     costs nothing and is correct once a certificate exists.
+#
+# Env vars supplied by the project:
+#   ARTIFACTS_BUCKET   - destination bucket
+#   ARTIFACTS_PREFIX   - key prefix, e.g. "desktop/"
+#
+# KEY LAYOUT is fixed by the backend, not chosen here. services/desktop/src/s3.store.ts
+# lists <prefix>macos/ and picks the NEWEST BY LastModified, then presigns it. So the file
+# lands under desktop/macos/, publishing supersedes the previous build by being newer, and
+# the key's last segment becomes the browser's download filename.
+version: 0.2
+
+phases:
+  install:
+    commands:
+      # The macOS image ships Node, but runtime-versions is not honoured on macOS fleets, so
+      # report what is actually there rather than assuming a major.
+      - node --version
+      # ⚠ pnpm MUST BE ON PATH, AND `corepack enable` CANNOT PUT IT THERE.
+      #
+      # Plain `corepack enable` writes global symlinks into /usr/local/bin, which macOS fleet
+      # builds cannot do - they run as the non-root user `cbuser`:
+      #     EACCES: permission denied, symlink '.../corepack/dist/pnpm.js' -> '/usr/local/bin/pnpm'
+      #
+      # Invoking `corepack pnpm ...` avoids PATH entirely, and that was the first attempt - but
+      # it is not sufficient. electron-builder shells out to pnpm BY NAME to collect production
+      # dependencies, and with no `pnpm` on PATH the packaging step dies with
+      #     ⨯ Node module collector spawn (pnpm ["list","--prod",...]) failed: spawn pnpm ENOENT
+      #
+      # So the shim goes in a writable directory and every later phase prepends it to PATH.
+      # Each CodeBuild command runs in its own shell, so PATH cannot be exported once here -
+      # it has to be re-established in each block that needs it, which is why the line below
+      # is repeated rather than factored out.
+      - corepack prepare "$(node -p "require('./package.json').packageManager")" --activate
+      - |
+        mkdir -p "$HOME/.local/bin"
+        corepack enable --install-directory "$HOME/.local/bin"
+        export PATH="$HOME/.local/bin:$PATH"
+        pnpm --version
+        command -v pnpm
+
+  pre_build:
+    commands:
+      - |
+        VERSION="$(node -p "require('./package.json').version")"
+        [ -n "$VERSION" ] || { echo "FATAL: no version in package.json"; exit 1; }
+        COMMIT="${CODEBUILD_RESOLVED_SOURCE_VERSION:-unknown}"
+        { echo "VERSION=$VERSION"; echo "COMMIT=$COMMIT"; echo "SHORT=${COMMIT:0:12}"; } > /tmp/build.env
+        echo "version=$VERSION commit=${COMMIT:0:12}"
+        echo "host arch: $(uname -m)  (universal build lipos in the x64 slice)"
+        # This sample publishes an UNSIGNED artifact (see the header for how to sign with your
+        # own Apple Developer ID). The publish step records signed=false in object metadata.
+        echo "SIGNED=false" >> /tmp/build.env
+        echo "=============================================================="
+        echo "NO SIGNING AND NO NOTARIZATION - building an UNSIGNED dmg."
+        echo "Gatekeeper will block it. Users must right-click -> Open,"
+        echo "or run: xattr -dr com.apple.quarantine <app>"
+        echo "=============================================================="
+
+  build:
+    commands:
+      - |
+        export PATH="$HOME/.local/bin:$PATH"
+        pnpm install --frozen-lockfile
+      # Verifies better-sqlite3 loads under both system Node and Electron. It rebuilds
+      # nothing (Node-API addon via prebuildify) but is the only check that catches a future
+      # dependency bump reverting to a per-ABI addon; the Vitest suite mocks the module and
+      # would pass either way.
+      - |
+        export PATH="$HOME/.local/bin:$PATH"
+        pnpm run rebuild-native
+      - |
+        export PATH="$HOME/.local/bin:$PATH"
+        pnpm run build
+      # ⚠ CSC_IDENTITY_AUTO_DISCOVERY=false stops electron-builder hunting the keychain for a
+      # signing identity when none is meant to be used. Remove it (and provide CSC_LINK /
+      # CSC_KEY_PASSWORD) if you wire in your own Developer ID certificate — see the header.
+      - |
+        export PATH="$HOME/.local/bin:$PATH"
+        . /tmp/build.env
+        export CSC_IDENTITY_AUTO_DISCOVERY=false
+        npx electron-builder --mac --universal --publish never
+
+  post_build:
+    commands:
+      # CodeBuild runs post_build even after a failed phase. Without this, a failed
+      # electron-builder would still publish whatever happened to be in release/.
+      - |
+        if [ "${CODEBUILD_BUILD_SUCCEEDING:-1}" != "1" ]; then
+          echo "REFUSING TO PUBLISH: an earlier phase failed. Nothing uploaded."
+          exit 1
+        fi
+
+      - |
+        . /tmp/build.env
+        ls -la release/ | sed 's/^/  /'
+        # Only the customer-facing artifacts. release/ also holds unpacked .app trees,
+        # blockmaps and builder-debug.yml, none of which should be offered as a download.
+        #
+        # ── ⚠ THE ORDER IS THE DOWNLOAD DECISION, SO THE .dmg GOES LAST ────────────────────────
+        #
+        # services/desktop/src/s3.store.ts `latest()` lists desktop/macos/, filters only the
+        # folder placeholder, and presigns the NEWEST object by LastModified. It has NO extension
+        # preference, so whichever file this loop uploads LAST becomes the download every macOS
+        # user receives.
+        #
+        # This was `find … \( -name '*.dmg' -o -name '*.zip' \) | sort`, and `sort` is ASCENDING:
+        # "…universal.dmg" precedes "…universal.zip", so the .zip uploaded second, became the
+        # newest object, and would have been served. Nothing fails when that happens - the button
+        # works and hands over a different artifact - which is why it survived unnoticed.
+        #
+        # A .dmg is the expected macOS install: mount, drag to Applications. A .zip expands to a
+        # bare .app the user has to place themselves, and this build is UNSIGNED (see the
+        # header), so Gatekeeper already makes that path awkward enough.
+        #
+        # ⚠ NOT `sort -r`. That also puts the .dmg last, but only because "z" > "d" - it fixes
+        # today's two filenames by luck. Adding a .pkg target would reshuffle it silently. Two
+        # explicit finds say which artifact wins, so the answer does not depend on spelling.
+        { find release -maxdepth 1 -type f -name '*.zip' | sort
+          find release -maxdepth 1 -type f -name '*.dmg' | sort; } > /tmp/files.txt
+        [ -s /tmp/files.txt ] || { echo "FATAL: electron-builder produced no .dmg or .zip"; exit 1; }
+        # ⚠ A .dmg IS REQUIRED, not merely preferred. Without one the block above still succeeds
+        # and the newest object is a .zip, so the download would quietly regress to the artifact
+        # this ordering exists to avoid. Fail instead of serving the wrong thing.
+        tail -n 1 /tmp/files.txt | grep -q '\.dmg$' || {
+          echo "FATAL: no .dmg in release/ - build.mac.target must produce one, because the"
+          echo "       download route serves the newest object and that must be the dmg"; exit 1; }
+        echo "artifacts (upload order - LAST one is what the download serves):"
+        while read -r f; do
+          echo "  $(basename "$f")  $(du -h "$f" | cut -f1)"
+        done < /tmp/files.txt
+        # package.json asks for a universal build; if the arch placeholder resolved to
+        # something else the filename says so, and shipping an arm64-only dmg as though it
+        # were universal would break every Intel Mac silently.
+        grep -q 'universal' /tmp/files.txt || {
+          echo "FATAL: no 'universal' artifact - build.mac.target requests arch [universal]"; exit 1; }
+
+      # ── ⚠ AN ARTIFACT DIGEST, IN THE OBJECT'S OWN METADATA ─────────────────────────────────────
+      #
+      # Publication used to verify only byte LENGTH: a substituted object of the same size passed,
+      # and there was no digest anywhere for a downloader — human or automated — to check an
+      # installer against.
+      #
+      # ⚠ IT GOES IN THE METADATA, NOT IN A SIBLING `.sha256` OBJECT, and that is not a style
+      # preference — a sibling would BREAK THE DOWNLOAD BUTTON. `services/desktop`'s `latest()` lists
+      # everything under `desktop/<platform>/`, filters only the folder placeholder, and picks the
+      # NEWEST BY LastModified. A `.sha256` uploaded after its installer becomes the newest object, so
+      # the download endpoint would presign the checksum file and every user would receive
+      # ~90 bytes of hex instead of the app. This buildspec already works around that hazard twice
+      # in the selection step above - by excluding blockmaps and `builder-debug.yml` from the two
+      # finds, and by uploading the `.dmg` LAST so it is the newest object. Metadata travels WITH
+      # the object and adds nothing to the listing, so it cannot win that race at all.
+      #
+      # ⚠ WHAT IT IS AND IS NOT WORTH. A digest bound to the object it describes detects a CORRUPTED
+      # or TRUNCATED download, and it gives support a way to confirm "the file you have is the file we
+      # published". It is NOT a substitute for code signing: an actor who can write the object can
+      # write its metadata too. Signing is the control (see the header); this is the part that ships
+      # without it.
+      - |
+        . /tmp/build.env
+        while read -r f; do
+          name=$(basename "$f")
+          key="${ARTIFACTS_PREFIX}macos/${name}"
+          # `shasum` is present on every macOS image; `awk` drops the filename it prints alongside.
+          sha=$(shasum -a 256 "$f" | awk '{print $1}')
+          [ -n "$sha" ] || { echo "FATAL: could not compute sha256 for $name"; exit 1; }
+          aws s3 cp "$f" "s3://$ARTIFACTS_BUCKET/$key" \
+            --metadata "version=$VERSION,commit=$COMMIT,build=${CODEBUILD_BUILD_NUMBER:-unknown},signed=${SIGNED},sha256=$sha"
+          # ⚠ tr, NOT bare wc. BSD wc (macOS) PADS its output with leading spaces while
+          # GNU wc (Linux) does not, so the string compare below saw " 409857987" vs
+          # "409857987" and failed on a dmg that had uploaded perfectly.
+          local_size=$(wc -c < "$f" | tr -d '[:space:]')
+          remote=$(aws s3api head-object --bucket "$ARTIFACTS_BUCKET" --key "$key" \
+                     --query ContentLength --output text)
+          printf '  %-56s local=%s remote=%s\n' "$key" "$local_size" "$remote"
+          [ "$local_size" = "$remote" ] || { echo "FATAL: size differs for $key"; exit 1; }
+          # ⚠ READ BACK, like the size above — for the same reason its comment gives. A digest that
+          # was silently dropped by the upload is worse than none: it reads as verified.
+          remote_sha=$(aws s3api head-object --bucket "$ARTIFACTS_BUCKET" --key "$key" \
+                         --query 'Metadata.sha256' --output text)
+          printf '  %-56s sha256=%s\n' "$key" "$sha"
+          [ "$remote_sha" = "$sha" ] || {
+            echo "FATAL: sha256 metadata missing or wrong for $key (remote=$remote_sha)"; exit 1; }
+        done < /tmp/files.txt
+        echo "published and verified"
+        aws s3 ls "s3://$ARTIFACTS_BUCKET/${ARTIFACTS_PREFIX}macos/"

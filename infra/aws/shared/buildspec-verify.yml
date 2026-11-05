@@ -1,0 +1,164 @@
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - |
+        set -e
+        status=$(aws cloudformation describe-stacks --stack-name "$TARGET_STACK" \
+                   --query 'Stacks[0].StackStatus' --output text)
+        echo "stack status: $status"
+        case "$status" in
+          CREATE_COMPLETE|UPDATE_COMPLETE) ;;
+          *) echo "unexpected stack status"; exit 1 ;;
+        esac
+        # Resolve the actual bucket names from the stack outputs rather than assuming.
+        aws cloudformation describe-stacks --stack-name "$TARGET_STACK" \
+          --query 'Stacks[0].Outputs[?ends_with(OutputKey, `BucketNameOut`)].[OutputKey,OutputValue]' \
+          --output text > /tmp/buckets.txt
+        cat /tmp/buckets.txt
+      - |
+        python3 - <<'PY'
+        import fnmatch, json, os, subprocess, sys
+
+        def aws(*args):
+            out = subprocess.run(["aws", *args], capture_output=True, text=True)
+            if out.returncode != 0:
+                return None, out.stderr.strip()
+            return (json.loads(out.stdout) if out.stdout.strip() else {}), None
+
+        expect_guard = os.environ.get("EXPECT_DELETE_PROTECTION", "true") == "true"
+        rows = [l.split() for l in open("/tmp/buckets.txt") if l.strip()]
+        assert rows, "no bucket outputs found on the stack"
+
+        # ⚠ THE COUNT IS ASSERTED, NOT JUST THE CONTENTS. The check set is derived from the
+        # stack's own conditioned Outputs, so a bucket that has LEFT the stack - a *BucketMode
+        # flipped to false or import, which withdraws its AWS::S3::BucketPolicy while the bucket
+        # itself is Retain - simply stopped being checked. "Nothing to check" and "everything
+        # checked" were the same green. An expected count makes a bucket leaving the managed set
+        # an explicit parameter change rather than a silent reduction in coverage.
+        #
+        # Deliberately a COUNT rather than a name list: the names are rendered by the Validate
+        # stage (base + BucketNameSuffix) and are not available to this stage without adding
+        # BuildOut to the Verify action's input artifacts. The count catches the case that
+        # matters - coverage shrinking without anyone saying so.
+        expect_count = int(os.environ.get("EXPECT_BUCKET_COUNT", "5"))
+        if len(rows) != expect_count:
+            found = ", ".join(sorted(b for _, b in rows))
+            raise SystemExit(
+                f"FAIL: expected {expect_count} managed buckets on {os.environ['TARGET_STACK']}, "
+                f"found {len(rows)} ({found}). Either a bucket left the stack (check the "
+                f"*BucketMode parameters) or EXPECT_BUCKET_COUNT needs updating deliberately."
+            )
+
+        fail = []
+        for key, bucket in rows:
+            role = key.replace("BucketNameOut", "")
+
+            v, err = aws("s3api", "get-bucket-versioning", "--bucket", bucket)
+            if err or v.get("Status") != "Enabled":
+                fail.append(f"{bucket}: versioning is {None if err else v.get('Status')}")
+
+            p, err = aws("s3api", "get-public-access-block", "--bucket", bucket)
+            cfg = {} if err else p.get("PublicAccessBlockConfiguration", {})
+            if not (len(cfg) == 4 and all(cfg.values())):
+                fail.append(f"{bucket}: public access block incomplete: {cfg}")
+
+            e, err = aws("s3api", "get-bucket-encryption", "--bucket", bucket)
+            alg = None if err else e["ServerSideEncryptionConfiguration"]["Rules"][0] \
+                     ["ApplyServerSideEncryptionByDefault"]["SSEAlgorithm"]
+            if alg != "AES256":
+                fail.append(f"{bucket}: encryption is {alg}, expected AES256")
+
+            pol, err = aws("s3api", "get-bucket-policy", "--bucket", bucket)
+            if err:
+                fail.append(f"{bucket}: no bucket policy ({err})")
+                continue
+            doc = json.loads(pol["Policy"])
+            sids = [s.get("Sid") for s in doc["Statement"]]
+            if "DenyInsecureTransport" not in sids:
+                fail.append(f"{bucket}: missing DenyInsecureTransport")
+            if expect_guard and "DenyBucketDeletion" not in sids:
+                fail.append(f"{bucket}: missing DenyBucketDeletion")
+            # ⚠ SEMANTIC MATCHING, AND THE WILDCARD-ALLOW CLAUSE, BOTH MIRRORING
+            # buildspec-validate.yml. This loop used to test `"s3:DeleteObjectVersion" in acts`
+            # - one spelling of a grant that can equally be written s3:Delete*, s3:D* or s3:* -
+            # and it had NO wildcard-Allow check at all, so the live gate was strictly weaker
+            # than the build gate it is supposed to backstop. That is the wrong way round: the
+            # build gate reads the committed template, this one reads what is actually live,
+            # and live drift is the threat the bucket template accepts by design when it
+            # declines to deny s3:PutBucketPolicy. Keep the two in step.
+            # ⚠ BOTH CHECKS ARE ALLOW-ONLY. With semantic matching, the "s3:*" in
+            # DenyInsecureTransport matches s3:DeleteObjectVersion, so testing Deny statements
+            # too would fail every correct bucket on the very statement doing the protecting.
+            for s in doc["Statement"]:
+                if s.get("Effect") != "Allow":
+                    continue
+                acts = s["Action"] if isinstance(s["Action"], list) else [s["Action"]]
+                for forbidden in ("s3:DeleteObjectVersion",):
+                    via = [a for a in acts if fnmatch.fnmatchcase(forbidden, a)]
+                    if via:
+                        fail.append(f"{bucket}/{s.get('Sid')}: grants {forbidden} via {via}")
+                wild = [a for a in acts if "*" in a or "?" in a]
+                if wild:
+                    fail.append(f"{bucket}/{s.get('Sid')}: wildcard action in an Allow: {wild}")
+            # The desktop bucket must remain a write-only drop box.
+            if role == "Desktop" and any((x or "").startswith("Customer") for x in sids):
+                fail.append(f"{bucket}: desktop bucket grants readers")
+            print(f"  {bucket:40} OK  ({', '.join(x for x in sids if x)})")
+
+        if fail:
+            print("\nVERIFICATION FAILED:")
+            for f in fail:
+                print("  -", f)
+            sys.exit(1)
+        print("\nall live buckets verified")
+        PY
+
+  post_build:
+    commands:
+      - |
+        aws cloudformation update-termination-protection \
+          --enable-termination-protection --stack-name "$TARGET_STACK"
+        echo "termination protection enabled"
+      - |
+        set -e
+        policy="${STACK_POLICY_PATH:-aws/shared/stack-policy.json}"
+        if [ ! -f "$policy" ]; then
+          echo "FAIL: stack policy not found at $policy"
+          exit 1
+        fi
+        aws cloudformation set-stack-policy --stack-name "$TARGET_STACK" \
+          --stack-policy-body "file://$policy"
+        echo "stack policy applied from $policy"
+        aws cloudformation get-stack-policy --stack-name "$TARGET_STACK" \
+          --query StackPolicyBody --output text > /tmp/live-stack-policy.json
+        python3 - "$policy" /tmp/live-stack-policy.json <<'PY'
+        import json, sys
+
+        # Compare the LIVE policy against the file we just applied, on the property that
+        # matters: which logical ids are denied Update:Replace and Update:Delete. Comparing the
+        # documents verbatim would fail on key order and whitespace; comparing the guarded set
+        # tests the guarantee.
+        def guarded(doc):
+            out = set()
+            for s in doc.get("Statement", []):
+                if s.get("Effect") != "Deny":
+                    continue
+                acts = s.get("Action", [])
+                acts = acts if isinstance(acts, list) else [acts]
+                if not {"Update:Replace", "Update:Delete"} <= set(acts):
+                    continue
+                rs = s.get("Resource", [])
+                out |= set(rs if isinstance(rs, list) else [rs])
+            return out
+
+        want = guarded(json.load(open(sys.argv[1])))
+        live = guarded(json.load(open(sys.argv[2])))
+        if not want:
+            sys.exit("FAIL: the stack policy file denies Update:Replace/Update:Delete on nothing")
+        missing = want - live
+        if missing:
+            sys.exit(f"FAIL: live stack policy does not guard {sorted(missing)}")
+        print(f"live stack policy verified: {len(live)} guarded resources, all {len(want)} expected present")
+        PY

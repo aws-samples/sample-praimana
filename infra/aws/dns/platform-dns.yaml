@@ -1,0 +1,114 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Praimana DNS records, deployed into the account that owns the Route 53 public hosted zone
+  (which may differ from the application account). Creates the ACM DNS-validation records for
+  the portal/API certificate and, once those endpoints exist, the portal and API hostnames.
+
+  Records only - no IAM, no data. Re-deploy with the SAME validation values on every run: removing
+  them stops ACM from auto-renewing the certificate. Leave a *Target empty until that endpoint
+  exists; the record is then simply not created.
+
+Parameters:
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Public hosted zone that contains PortalDomainName and ApiDomainName.
+
+  PortalDomainName:
+    Type: String
+    AllowedPattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+    Description: Portal hostname, e.g. portal.example.com.
+
+  ApiDomainName:
+    Type: String
+    AllowedPattern: "^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$"
+    Description: API custom hostname, e.g. api.portal.example.com.
+
+  PortalValidationName:
+    Type: String
+    Default: ""
+    Description: ACM validation CNAME name for PortalDomainName (from describe-certificate).
+  PortalValidationValue:
+    Type: String
+    Default: ""
+  ApiValidationName:
+    Type: String
+    Default: ""
+    Description: ACM validation CNAME name for ApiDomainName.
+  ApiValidationValue:
+    Type: String
+    Default: ""
+
+  PortalTarget:
+    Type: String
+    Default: ""
+    Description: CloudFront distribution domain (PortalDistributionDomainName). Empty = no record yet.
+  ApiTarget:
+    Type: String
+    Default: ""
+    Description: API Gateway regional domain name for ApiDomainName. Empty = no record yet.
+
+  RecordTtl:
+    Type: Number
+    Default: 300
+    MinValue: 60
+
+Conditions:
+  HasPortalValidation: !And
+    - !Not [!Equals [!Ref PortalValidationName, ""]]
+    - !Not [!Equals [!Ref PortalValidationValue, ""]]
+  HasApiValidation: !And
+    - !Not [!Equals [!Ref ApiValidationName, ""]]
+    - !Not [!Equals [!Ref ApiValidationValue, ""]]
+  HasPortalTarget: !Not [!Equals [!Ref PortalTarget, ""]]
+  HasApiTarget: !Not [!Equals [!Ref ApiTarget, ""]]
+
+Resources:
+  PortalValidationRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasPortalValidation
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref PortalValidationName
+      Type: CNAME
+      TTL: !Ref RecordTtl
+      ResourceRecords: [!Ref PortalValidationValue]
+
+  ApiValidationRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasApiValidation
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ApiValidationName
+      Type: CNAME
+      TTL: !Ref RecordTtl
+      ResourceRecords: [!Ref ApiValidationValue]
+
+  # CNAMEs rather than aliases: both names are subdomains (never a zone apex), and a CNAME needs
+  # no knowledge of the target's hosted-zone id, so the stack works across accounts unchanged.
+  PortalRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasPortalTarget
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref PortalDomainName
+      Type: CNAME
+      TTL: !Ref RecordTtl
+      ResourceRecords: [!Ref PortalTarget]
+
+  ApiRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasApiTarget
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ApiDomainName
+      Type: CNAME
+      TTL: !Ref RecordTtl
+      ResourceRecords: [!Ref ApiTarget]
+
+Outputs:
+  PortalRecordName:
+    Condition: HasPortalTarget
+    Value: !Ref PortalRecord
+  ApiRecordName:
+    Condition: HasApiTarget
+    Value: !Ref ApiRecord

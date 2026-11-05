@@ -1,0 +1,2582 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Praimana - the App-account API tier: thirteen service Lambdas, the HTTP API
+  and its JWT authorizer, two EventBridge rules, the users-stream event source mapping, and the
+  optional custom-domain mapping. The portal and the alarms/dashboard/canary are each a separate
+  tier. Takes five values from the tiers below as parameters, not imports.
+
+Globals:
+  Function:
+    Runtime: nodejs24.x
+    Architectures: [arm64]
+    MemorySize: 256
+    Timeout: 15
+    Tracing: Active
+    Environment:
+      Variables:
+        NODE_OPTIONS: --enable-source-maps
+        ENVIRONMENT: !Ref Environment
+        EVENT_BUS_NAME: praimana-events
+        EAST_WEST_TIMEOUT_MS: !Ref EastWestTimeoutMs
+    Tags:
+      ApplicationName: Praimana
+      Environment: !Ref Environment
+
+Parameters:
+  KmsKeyArn:
+    Type: String
+    Description: >
+      ARN of the customer-managed KMS key from platform-kms.yaml (tier 0). REQUIRED, no
+      default. Enables a customer-managed KMS key for encryption at rest.
+
+      ⚠ REQUIRED RATHER THAN OPTIONAL ON PURPOSE. An optional key would mean wrapping every
+      encryption property in an Fn::If, and neither cfn_nag nor checkov can resolve an
+      intrinsic - the findings this exists to clear would stay open, exactly as W73 did for
+      the BillingMode parameter. A required parameter is the only shape that both encrypts
+      and closes the finding.
+
+      ⚠ Pass the full ARN, not a key id and not an alias: an alias can be repointed at a
+      different key without this stack changing.
+    AllowedPattern: "^arn:aws[a-zA-Z-]*:kms:[a-z0-9-]+:[0-9]{12}:key/[a-f0-9-]+$"
+    ConstraintDescription: Must be a full KMS key ARN from the tier-0 KMS stack.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of a pre-validated ACM certificate (REGIONAL, same region as this stack)
+      covering DomainName. Left empty disables the custom domain regardless of
+      EnableCustomDomain.
+
+  ApiAllowedOrigins:
+    Type: CommaDelimitedList
+    Description: >-
+      Web origins permitted to make cross-origin calls to the API, as a comma-separated list.
+      REQUIRED - no default, so the origin list is always an explicit deployment decision.
+
+      SET IT to your portal origin (and the desktop client's loopback, if it makes
+      browser-style requests). A value of "*" means any page on the internet can call every
+      /v1/* route with a stolen bearer and read the reply, including /v1/admin/* and
+      /v1/user-access/*.
+
+      AllowCredentials is deliberately not set, so cookies are never sent cross-origin and this
+      is not a CSRF vector - a bearer token is still required either way.
+    AllowedPattern: "^\\*$|^https?://[A-Za-z0-9.-]+(:[0-9]+)?$"
+    ConstraintDescription: >
+      Each entry must be a scheme://host[:port] origin with no path or trailing slash (http://
+      only sensibly for localhost), or the single value "*" to opt in to any origin.
+
+  CognitoDomainPrefix:
+    Type: String
+    Description: >
+      REQUIRED. Prefix for the Cognito Hosted UI domain (<prefix>.auth.<region>.amazoncognito.com),
+      the same value as platform-identity.yaml. Globally unique; no account-id fallback.
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+    ConstraintDescription: Required. Lowercase alphanumerics and dashes.
+
+  DesktopBucket:
+    Type: String
+    Description: >
+      REQUIRED. Your installer bucket (praimana-artifacts<BucketNameSuffix> from
+      infra/aws/shared/platform-buckets.yaml), holding desktop/{macos,windows}/. No default: the
+      shared stack always appends a suffix, so an unsuffixed default never names a real bucket.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid S3 bucket name.
+
+  DesktopBucketOwnerAccountId:
+    Type: String
+    Default: ""
+    Description: >
+      12-digit AWS account ID that owns DesktopBucket (the account where
+      infra/aws/shared/platform-buckets.yaml is deployed). Becomes DESKTOP_BUCKET_OWNER, sent as
+      ExpectedBucketOwner on every installer request and presigned download, so S3 refuses them if
+      another account owns a bucket by that name. Leave empty when the bucket is in this account.
+    AllowedPattern: "^(\\d{12})?$"
+    ConstraintDescription: Must be a 12-digit AWS account ID, or empty for this account.
+
+  DomainName:
+    Type: String
+    Default: api.ai.example.test
+    Description: >
+      Custom subdomain for the HTTP API. The admin front-end lives on the parent
+      ai.example.test (CloudFront); the API is split onto the api.* child
+      so the two don't collide.
+
+  EastWestTimeoutMs:
+    Type: Number
+    Default: 2500
+    MinValue: 200
+    MaxValue: 10000
+    Description: >-
+      Per-attempt deadline, in milliseconds, for a service-to-service HTTP call
+      (the authorization probes between team/workshop/collaboration/evaluation/
+      source/ai). Applied to every function via Globals.
+
+      LOWERING THIS BELOW ~1800 REINTRODUCED THAT BUG while the services ran in a VPC,
+      where the PrivateLink first call cost ~1.8s. The functions now run outside a VPC, so a
+      lower value is legitimate if you measure your own first-call cost. The service code warns on a value at or below the
+      measured cost rather than refusing it, for exactly that case.
+
+      MaxValue is 10000 because the point of the timeout is that a hung dependency
+      cannot hold a Lambda: functions time out at 15s and the gateway at 29s, so a
+      larger value would restore the unbounded wait while looking configured. The
+      service code independently clamps to the same 200..10000 range and falls back
+      to its compiled default if this is malformed — a stack parameter and a bundled
+      constant can disagree, so neither is trusted alone.
+
+  EmailFrom:
+    Type: String
+    Default: ""
+    Description: >-
+      Sender address for notify email; must be AT the verified domain (e.g.
+      no-reply@<verified-domain>). EMPTY (the default) makes notify fall back to its
+      console transport — it logs the email instead of sending. That is the safe
+      default: an invite is recorded and re-sendable rather than silently failing.
+      Setting this is what actually turns sending on (see notify/src/app.ts).
+
+  EmailReplyTo:
+    Type: String
+    Default: ""
+    Description: >-
+      Reply-To address for notify email (comma-separate for several). Needs NO SES
+      verification of its own — only EmailFrom must be a verified identity — so this
+      can be a real human mailbox on any domain. EMPTY means replies to a no-reply@
+      sender are DISCARDED with no bounce to the sender and no signal to us, so set
+      it whenever recipients are people who might answer.
+
+  EnableBulkProvision:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Create the bulk team-provisioning worker: its role, function,
+      EventBridge rule and invoke permission.
+
+      DEFAULT false, and the reason is an ordering constraint rather than caution: the
+      function's CodeUri is lambda/v<ReleaseVersion>/bulk-provision/bulk-provision.zip, so
+      enabling it against a release published BEFORE that package existed fails the stack
+      update on an object that is not there. Publish a release containing it, then set this.
+
+      ⚠ NO SHARED SECRET IS INVOLVED. An earlier draft added an InternalServiceToken for
+      edgeIdentityMiddleware's path 3. It was unnecessary: the worker invokes team,
+      user-access and notify DIRECTLY, so it constructs the invocation event itself and can
+      populate requestContext.authorizer.jwt.claims — which path 1 reads WITHOUT verifying,
+      because the gateway normally does that. lambda:InvokeFunction IS the credential.
+      Adding the secret would have bought nothing and would have enabled path 3 permanently
+      on three services for anyone who ever obtained the string.
+
+  EnableCustomDomain:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Front the HTTP API with the custom domain (requires AcmCertificateArn).
+
+  Environment:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional environment name (e.g. dev, staging, prod). Used only as a tag /
+      STAGE env value. It is NOT put in the API URL — the HTTP API always uses the
+      "$default" stage so paths have no /dev prefix (Hono routes on rawPath). Leave
+      empty to omit the environment tag entirely.
+
+  InternalBaseUrl:
+    Type: String
+    Default: ""
+    AllowedPattern: "^$|^https://[A-Za-z0-9.-]+(:[0-9]+)?/v1$"
+    ConstraintDescription: >
+      Must be empty (first deploy), or an https:// URL ending in /v1 - no http://, no trailing
+      slash, no query string. It is handed live user bearer tokens.
+    Description: >
+      Base URL (…/v1) services use for east-west calls. Leave empty on the FIRST
+      deploy (avoids a circular dependency on the HTTP API this stack creates), then
+      redeploy with InternalBaseUrl=<ApiUrl>/v1.
+
+  LogRetentionInDays:
+    Type: String
+    Default: "30"
+    AllowedValues:
+      ["0", "1", "3", "5", "7", "14", "30", "60", "90", "120", "150", "180", "365", "400",
+       "545", "731", "1096", "1827", "2192", "2557", "2922", "3288", "3653"]
+    Description: >-
+      How many days CloudWatch keeps this platform's Lambda logs. Applied to every log group
+      this template creates.
+
+      "0" means NEVER EXPIRE — the behaviour every account had before this parameter existed.
+      It is an allowed value on purpose (some retention policies require indefinite retention),
+      but it is not the default, because unbounded growth should be a choice somebody made
+      rather than one nobody noticed.
+
+      30 days is the default because these are OPERATIONAL logs read during an incident, and an
+      incident is investigated in hours or days. The compliance record is the audit TABLE, not
+      these groups.
+
+  PortalUrl:
+    Type: String
+    Default: ""
+    Description: >-
+      Origin of the PORTAL web app (e.g. https://ai.example.test), with no trailing
+      slash. Used by the bulk-provisioning worker to build the /join/<token> links in invitation
+      emails.
+
+      ⚠ THIS IS NOT `DomainName`. That parameter is the API's domain
+      (api.ai.example.test), and the first version of this worker DERIVED APP_URL from
+      it — which produced invite links pointing at the API, where /join does not exist. Every
+      recipient would have got a dead link, and because each invitation token is SINGLE-USE the only
+      recovery is revoking and re-inviting everybody. The two domains are genuinely different things
+      and must not be inferred from one another.
+
+      EMPTY IS SAFE: the worker refuses to send anything when APP_URL is unset, so a forgotten value
+      fails loudly BEFORE any team or account is created rather than mailing dead links.
+
+  RatingsModelId:
+    Type: String
+    Default: "us.amazon.nova-2-lite-v1:0"
+    Description: >-
+      Model, inference-profile id, or application-inference-profile ARN for TEAM AI RATINGS.
+      The adapter uses Bedrock's Converse API, so Nova and Anthropic are interchangeable
+      here with no code change.
+      ⚠ THE `us.` PREFIX IS LOAD-BEARING, NOT COSMETIC. It names the US geo cross-region
+      inference profile. AWS's Nova 1-to-2 migration guide states Nova 2 Lite is available
+      "through Global CRIS, US CRIS, EU CRIS, and JP CRIS endpoints" and instructs: "when
+      accessing models from a US region, use the us. prefix". A bare `amazon.nova-2-lite-v1:0`
+      is the MODEL identifier (what a foundation-model ARN contains); passing it as a modelId
+      risks "ValidationException: Invocation of model ID ... with on-demand throughput isn't
+      supported. Retry your request with the ID or ARN of an inference profile". `us.` is
+      correct whether or not in-region on-demand also happens to work, so it is the safe
+      default. From us-east-1 it routes to us-east-1, us-east-2 and us-west-2.
+      Outside the US use `eu.` / `jp.`, or `global.` to route worldwide (no data-residency
+      guarantee). NOTHING DERIVES THIS FROM AWS::Region - a deploy outside the US must set
+      it explicitly.
+      ⚠ NOT AN ACCOUNT-SPECIFIC ARN, deliberately. An application inference profile
+      (arn:aws:bedrock:<account>:application-inference-profile/<id>) wrapping this same
+      model would also work, but such an ARN embeds an account id and is wrong in every other
+      account, which is a poor default for a template whose whole purpose is deploying into a
+      fresh one. A system-defined profile id resolves in any account where the model is enabled.
+      The IAM grant on AIServiceRole already covers both forms: `inference-profile/*` in
+      this account for the profile itself, and `foundation-model/amazon.nova-*` with a
+      WILDCARD REGION for the models the profile fans out to on the second hop.
+      ⚠ NOVA RATHER THAN ANTHROPIC avoids the Anthropic use-case gate: an account that has not
+      submitted the Anthropic use-case form gets "Model use case details have not been submitted
+      for this account" from every Anthropic model, so a human must submit that form in the
+      Bedrock console before an Anthropic id works here. Nova needs no such form.
+      ⚠ THE MODEL MUST BE ENABLED IN THE TARGET ACCOUNT AND REGION. Bedrock model access is
+      per-account: listed is not the same as enabled. Ratings answer 503
+      RATINGS_UNAVAILABLE rather than failing silently if it is not.
+      ⚠ RE-RUN the summary probe when changing this: obedience to the "never single out an
+      individual" rule is behavioural, not a swap, and the summary is the only ratings output
+      a judge can read.
+
+  ReleaseVersion:
+    Type: String
+    Default: "1.0.0"
+    AllowedPattern: "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    ConstraintDescription: must look like 0.0.1 (<major>.<minor>.<patch>), with no leading "v"
+    Description: >-
+      The release whose artifacts this stack deploys. This is the services repo's
+      package.json version VERBATIM, and it is the same string platform-portal.yaml takes as
+      PortalReleaseVersion - one release, one number, whichever tier you are deploying.
+
+  ServicesBucket:
+    Type: String
+    Description: >
+      REQUIRED. Your Lambda zip bucket (praimana-services<BucketNameSuffix> from
+      infra/aws/shared/platform-buckets.yaml). No default, for the same reason as DesktopBucket.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid S3 bucket name.
+
+  SesIdentityArn:
+    Type: String
+    Default: ""
+    Description: >-
+      ARN of a verified identity in ANOTHER account, to send on its behalf
+      (arn:aws:ses:<region>:<ses-account>:identity/<verified-domain>). EMPTY is the
+      normal setting and the current one: the sender domain is verified in THIS
+      account, so sends are same-account and need no delegation. Delegate sending
+      needs BOTH sides — setting this adds the ARN to the notify role's ses:SendEmail
+      grant, AND the owning account must attach an authorization policy to the
+      identity naming that role as principal. The role's send grant itself is gated
+      on EmailFrom, not on this parameter, so leaving it empty does NOT remove
+      permission to send. For the owning account's side, see "Using sending authorization
+      with Amazon SES" in the Amazon SES Developer Guide
+      (https://docs.aws.amazon.com/ses/latest/dg/sending-authorization.html).
+
+  UserPoolId:
+    Type: String
+    Description: >
+      UserPoolId output of platform-identity.yaml. Interpolated into the JWT authorizer's
+      issuer and into the user-pool ARN that several roles are scoped to.
+    AllowedPattern: "^[a-z]{2}-[a-z]+-[0-9]{1}_[A-Za-z0-9]+$"
+    ConstraintDescription: Must look like us-east-1_ABC123def.
+
+  UserPoolClientId:
+    Type: String
+    Description: >
+      UserPoolClientId output of platform-identity.yaml - the JWT audience. Stable across a
+      callback-URL revision, which is what makes the portal two-pass safe.
+    AllowedPattern: "^[a-z0-9]{16,64}$"
+    ConstraintDescription: Must be a Cognito app client id.
+
+  DeadLetterQueueArn:
+    Type: String
+    Description: >
+      DeadLetterQueueArn output of platform-plumbing.yaml. Target of the two rules' and the
+      projection's failure paths.
+    AllowedPattern: "^arn:aws[a-z-]*:sqs:[a-z0-9-]+:[0-9]{12}:[A-Za-z0-9_-]+$"
+    ConstraintDescription: Must be an SQS queue ARN.
+
+  DocsBucketName:
+    Type: String
+    Description: >
+      DocsBucketName output of platform-plumbing.yaml. ⚠ THE PATTERN IS THE SCOPING: this is
+      interpolated into an S3 ARN that grants object access, so a wildcard here would widen
+      that grant. Same value class as every bucket-name parameter in these repos.
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be a valid S3 bucket name.
+
+  ResourcesBucketName:
+    Type: String
+    Description: >
+      ResourcesBucketName output of platform-plumbing.yaml — workshop-wide material uploaded by the
+      facilitator. Becomes RESOURCES_BUCKET on the Workshop function. ⚠ THE PATTERN IS THE SCOPING, for
+      the same reason DocsBucketName states: this is interpolated into an S3 ARN that grants object
+      access, so a wildcard here would widen that grant.
+
+      ⚠ EMPTY IS PERMITTED AND MEANS "NO RESOURCE STORAGE". The Workshop service then answers 501 on
+      every resource route rather than opening an upload against bucket "" and failing inside the SDK.
+      That keeps a tier that has not yet been redeployed working exactly as before, instead of
+      presenting a Resources tab that silently drops files.
+    Default: ""
+    AllowedPattern: "^$|^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$"
+    ConstraintDescription: Must be empty, or a valid S3 bucket name.
+
+  UsersTableStreamArn:
+    Type: String
+    Description: >
+      UsersTableStreamArn output of platform-dynamodb.yaml. Consumed by the event source
+      mapping that drives the user-projection read models. The only table value this tier
+      needs - the other 33 are reached by hardcoded name.
+    AllowedPattern: "^arn:aws[a-z-]*:dynamodb:[a-z0-9-]+:[0-9]{12}:table/[A-Za-z0-9_.-]+/stream/.+$"
+    ConstraintDescription: Must be a DynamoDB stream ARN.
+
+Conditions:
+  BulkProvisionEnabled: !Equals [!Ref EnableBulkProvision, "true"]
+  HasResourcesBucket: !Not [!Equals [!Ref ResourcesBucketName, ""]]
+  HasDesktopBucketOwner: !Not [!Equals [!Ref DesktopBucketOwnerAccountId, ""]]
+  DomainEnabled: !And
+    - !Equals [!Ref EnableCustomDomain, "true"]
+    - !Not [!Equals [!Ref AcmCertificateArn, ""]]
+  HasEmailFrom: !Not [!Equals [!Ref EmailFrom, ""]]
+  HasSesIdentityArn: !Not [!Equals [!Ref SesIdentityArn, ""]]
+  LogsNeverExpire: !Equals [!Ref LogRetentionInDays, "0"]
+Resources:
+  KmsUsePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Data-plane use of the platform CMK. No administrative actions.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: UsePlatformKey
+            Effect: Allow
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: !Ref KmsKeyArn
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-lambda-execution
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-workshops"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-workshops/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-phases"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-phases/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-phases"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-phases/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-formats"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-formats/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-tasks"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-tasks/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-messages"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-messages/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-collaboration-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-collaboration-users-readmodel/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-submissions-v2"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-submissions-v2/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-scores"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-scores/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-member-ratings-v2"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-member-ratings-v2/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-workshop-results"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-workshop-results/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-evaluation-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-evaluation-users-readmodel/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-evaluation-activity-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-evaluation-activity-readmodel/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-git-commits"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-git-commits/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-git-files"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-git-files/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-source-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-source-users-readmodel/index/*"
+              - Effect: Deny
+                Action:
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit/index/*"
+        - PolicyName: EventBridgePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/praimana-events"
+
+        - PolicyName: WorkshopServiceInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:praimana-workshop"
+
+        - PolicyName: NotifyServiceInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:praimana-notify"
+
+        - !If
+          - HasResourcesBucket
+          - PolicyName: WorkshopResourcesAccess
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:GetObject
+                    - s3:DeleteObject
+                    - s3:AbortMultipartUpload
+                    - s3:ListMultipartUploadParts
+                  Resource: !Sub "arn:${AWS::Partition}:s3:::${ResourcesBucketName}/*"
+
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                    - s3:ListBucketMultipartUploads
+                  Resource: !Sub "arn:${AWS::Partition}:s3:::${ResourcesBucketName}"
+          - !Ref AWS::NoValue
+
+  TeamServiceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-team-service
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-teams"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-teams/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-members"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-members/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-users-readmodel/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-invitations"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-invitations/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-bulk-batches"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-bulk-batches/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit/index/*"
+              - Effect: Deny
+                Action:
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit/index/*"
+        - PolicyName: EventBridgePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/praimana-events"
+        - PolicyName: WorkshopServiceInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:praimana-workshop"
+        - PolicyName: NotifyServiceInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:praimana-notify"
+
+  IdentityFunctionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >-
+              Irreducible: the AWS APIs for these actions take NO resource ARN and IAM rejects
+              anything but '*' (dynamodb:ListStreams, cloudwatch:DescribeAlarms, Cost Explorer
+              reads, s3:ListAllMyBuckets, cloudwatch:PutMetricData). Verified by experiment, not
+              assumption - iam simulate said an ARN-scoped resource would work and the live call
+              returned AccessDenied regardless. Each is already narrowed by a query filter or an
+              IAM condition wherever the API permits.
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-identity-service
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IdentityTables
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-users"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-users/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-feedback"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-feedback/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-cost-cache"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-send-quota"
+        - PolicyName: EventBridgePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/praimana-events"
+        - PolicyName: NotifyServiceInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:praimana-notify"
+        - PolicyName: PlatformHealthRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                Resource: "*"
+        - PolicyName: PlatformSpendRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ce:GetCostAndUsage
+                Resource: "*"
+
+  RatingsGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: praimana-ratings
+      Description: >-
+        Applied to every ai-service Converse call. Screens transcript-derived input for prompt
+        attacks and harmful content, and replies for harmful content, profanity and PII.
+      BlockedInputMessaging: This request was blocked by the platform's content guardrail.
+      BlockedOutputsMessaging: The response was blocked by the platform's content guardrail.
+      ContentPolicyConfig:
+        FiltersConfig:
+          - { Type: SEXUAL, InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: VIOLENCE, InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: HATE, InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: INSULTS, InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: MISCONDUCT, InputStrength: HIGH, OutputStrength: HIGH }
+          - { Type: PROMPT_ATTACK, InputStrength: HIGH, OutputStrength: NONE }
+      WordPolicyConfig:
+        ManagedWordListsConfig:
+          - Type: PROFANITY
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          - { Type: EMAIL, Action: ANONYMIZE }
+          - { Type: PHONE, Action: ANONYMIZE }
+          - { Type: AWS_ACCESS_KEY, Action: ANONYMIZE }
+          - { Type: AWS_SECRET_KEY, Action: ANONYMIZE }
+          - { Type: PASSWORD, Action: ANONYMIZE }
+          - { Type: CREDIT_DEBIT_CARD_NUMBER, Action: ANONYMIZE }
+      Tags:
+        - { Key: ApplicationName, Value: Praimana }
+        - { Key: Environment, Value: !Ref Environment }
+
+  RatingsGuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt RatingsGuardrail.GuardrailId
+      Description: >-
+        Guardrail configuration 1. CloudFormation only publishes a new version when this resource
+        changes, so bump the number in this description whenever RatingsGuardrail is edited.
+
+  AIServiceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-ai-service
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:application-inference-profile/*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/amazon.nova-*"
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.claude-*"
+              - Sid: ApplyRatingsGuardrail
+                Effect: Allow
+                Action:
+                  - bedrock:ApplyGuardrail
+                Resource: !GetAtt RatingsGuardrail.GuardrailArn
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-ai-threads"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-ai-threads/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-ai-messages"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-ai-messages/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-ai-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-ai-users-readmodel/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-ai-ratings"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-ai-ratings/index/*"
+              - Effect: Deny
+                Action:
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit/index/*"
+        - PolicyName: EventBridgePublish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/praimana-events"
+
+  DocsRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-docs
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DocsDynamoDBAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-docs"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-teams"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-teams/index/*"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-members"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-docs-users-readmodel"
+        - PolicyName: DocsS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:DeleteObject
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${DocsBucketName}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${DocsBucketName}"
+
+  DesktopRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-desktop
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DesktopInstallerRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub "arn:aws:s3:::${DesktopBucket}/desktop/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource: !Sub "arn:aws:s3:::${DesktopBucket}"
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - "desktop/"
+                      - "desktop/*"
+
+  NotifyRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-notify
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NotifySendQuota
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-send-quota"
+        - !If
+          - HasEmailFrom
+          - PolicyName: NotifySesSend
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ses:SendEmail
+                    - ses:SendRawEmail
+                  Resource: !If
+                    - HasSesIdentityArn
+                    - - !Ref SesIdentityArn
+                      - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                      - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/*"
+                    - - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*"
+                      - !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:configuration-set/*"
+          - !Ref AWS::NoValue
+
+  UserAccessRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-user-access
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UserAccessCognitoAdmin
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:AdminDisableUser
+                  - cognito-idp:AdminEnableUser
+                  - cognito-idp:AdminListGroupsForUser
+                  - cognito-idp:ListUsers
+                  - cognito-idp:ListUsersInGroup
+                Resource: !Sub "arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}"
+              - Effect: Allow
+                Action: [dynamodb:UpdateItem, dynamodb:GetItem, dynamodb:Query]
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-users"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-users/index/*"
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:Query]
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-invitations"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-invitations/index/*"
+              - Effect: Allow
+                Action: dynamodb:DeleteItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-invitations"
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit"
+              - Effect: Deny
+                Action:
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:TransactWriteItems
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-audit/index/*"
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/praimana-events"
+
+  AiLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/ai
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  BulkProvisionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/bulk-provision
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  CollaborationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/collaboration
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  DesktopLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/desktop
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  DocsLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/docs
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  EvaluationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/evaluation
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  IdentityLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/identity
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  NotifyLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/notify
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  SourceLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/source
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  TeamLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/team
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  UserAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/user-access
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  UserProjectionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/user-projection
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  WorkshopLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/workshop
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      KmsKeyId: !Ref KmsKeyArn
+      LogGroupName: /praimana/api-access
+      RetentionInDays: !If [LogsNeverExpire, !Ref "AWS::NoValue", !Ref LogRetentionInDays]
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    DependsOn: ApiAccessLogGroup
+    Properties:
+      StageName: $default
+      Description: Praimana edge API — JWT-authorized, routes to per-service Lambdas.
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 200
+        ThrottlingBurstLimit: 400
+        DetailedMetricsEnabled: true
+      RouteSettings:
+        "POST /v1/ai/teams/{teamId}/ratings/analyze":
+          ThrottlingRateLimit: 1
+          ThrottlingBurstLimit: 5
+          DetailedMetricsEnabled: true
+      AccessLogSettings:
+        DestinationArn: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/praimana/api-access"
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","sub":"$context.authorizer.claims.sub","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","path":"$context.path","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","responseLatency":"$context.responseLatency","integrationStatus":"$context.integrationStatus","integrationLatency":"$context.integrationLatency","integrationErrorMessage":"$context.integrationErrorMessage","authorizerError":"$context.authorizer.error"}'
+      CorsConfiguration:
+        AllowOrigins: !Ref ApiAllowedOrigins
+        AllowHeaders: ["authorization", "content-type"]
+        AllowMethods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"]
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+              audience:
+                - !Ref UserPoolClientId
+
+  IdentityFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-identity
+      Description: Identity service. Serves and updates the caller's profile (GET/PATCH /v1/auth/me) and unauthenticated Cognito discovery config (GET /v1/auth/config).
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/identity/identity.zip"
+      Handler: handler.handler
+      Role: !GetAtt IdentityFunctionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref IdentityLogGroup
+      Environment:
+        Variables:
+          TABLE_USERS: praimana-users
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+          COGNITO_CLIENT_ID: !Ref UserPoolClientId
+          COGNITO_HOSTED_UI_DOMAIN: !Sub "https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+          TABLE_FEEDBACK: praimana-feedback
+          SEND_QUOTA_TABLE: praimana-send-quota
+          TABLE_COST_CACHE: praimana-cost-cache
+          NOTIFY_FUNCTION_NAME: praimana-notify
+          PORTAL_URL: !Ref PortalUrl
+      Events:
+        Me:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /v1/auth/me
+        UpdateMe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: PATCH
+            Path: /v1/auth/me
+        Config:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /v1/auth/config
+            Auth:
+              Authorizer: NONE
+        AdminUsers:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /v1/admin/users
+        AdminUserNames:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /v1/admin/user-names
+        Feedback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /v1/auth/feedback
+        AdminFeedback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /v1/admin/feedback
+        AdminFeedbackAcknowledge:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: POST
+            Path: /v1/admin/feedback/{id}/acknowledge
+        AdminPlatformHealth:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /v1/admin/platform-health
+        AdminCost:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Method: GET
+            Path: /v1/admin/cost
+
+  AiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-ai
+      Description: AI service. AI chat thread/transcript storage, CLI turn sync, and the executive-only ratings assessment, under /v1/ai/*.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/ai/ai.zip"
+      Handler: handler.handler
+      Timeout: 60
+      MemorySize: 512
+      Role: !GetAtt AIServiceRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref AiLogGroup
+      Environment:
+        Variables:
+          TABLE_AI_THREADS: praimana-ai-threads
+          TABLE_AI_MESSAGES: praimana-ai-messages
+          TABLE_AI_USERS_READMODEL: praimana-ai-users-readmodel
+          TABLE_TEAM_AI_RATINGS: praimana-team-ai-ratings
+          TEAM_SERVICE_URL: !Ref InternalBaseUrl
+          COLLABORATION_SERVICE_URL: !Ref InternalBaseUrl
+          EVALUATION_SERVICE_URL: !Ref InternalBaseUrl
+          BEDROCK_RATINGS_MODEL_ID: !Ref RatingsModelId
+          BEDROCK_GUARDRAIL_ID: !GetAtt RatingsGuardrail.GuardrailId
+          BEDROCK_GUARDRAIL_VERSION: !GetAtt RatingsGuardrailVersion.Version
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+      Events:
+        AiRoutes:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/ai/{proxy+}"
+            Method: ANY
+        RatingsAnalyze:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/ai/teams/{teamId}/ratings/analyze"
+            Method: POST
+
+  TeamFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway. Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-team
+      Description: Team service. Manages teams, membership, access checks, and invitations under /v1/teams/*.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/team/team.zip"
+      Handler: handler.handler
+      Role: !GetAtt TeamServiceRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref TeamLogGroup
+      Environment:
+        Variables:
+          TABLE_TEAMS: praimana-teams
+          TABLE_TEAM_MEMBERS: praimana-team-members
+          TABLE_INVITATIONS: praimana-invitations
+          TABLE_TEAM_USERS_READMODEL: praimana-team-users-readmodel
+          TABLE_AUDIT: praimana-audit
+          TABLE_BULK_BATCHES: praimana-bulk-batches
+          WORKSHOP_SERVICE_URL: !Ref InternalBaseUrl
+          WORKSHOP_FUNCTION_NAME: praimana-workshop
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+      Events:
+        Mine:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/teams/mine
+            Method: GET
+        Directory:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/teams/directory
+            Method: GET
+        DirectoryUserIds:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/directory/user-ids
+            Method: GET
+        DirectoryInvitedBy:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/directory/invited-by
+            Method: GET
+        Join:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/teams/join
+            Method: POST
+        WorkshopTeams:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/teams"
+            Method: ANY
+        WorkshopBulkProvision:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/bulk-provision"
+            Method: POST
+
+        WorkshopBulkProvisionBatches:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/bulk-provision/batches"
+            Method: GET
+
+        WorkshopBulkProvisionBatch:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/bulk-provision/batches/{batchId}"
+            Method: PATCH
+
+        WorkshopMembership:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/membership"
+            Method: GET
+        Members:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/members"
+            Method: ANY
+        MemberById:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/members/{userId}"
+            Method: ANY
+        MemberReactivate:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/members/{userId}/reactivate"
+            Method: POST
+        FormerMembers:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/former-members"
+            Method: GET
+        Access:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/access"
+            Method: GET
+        Invitations:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/invitations"
+            Method: ANY
+        InvitationByEmail:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/invitations/{proxy+}"
+            Method: ANY
+        MyInvitations:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/invitations/mine
+            Method: GET
+        AcceptMyInvitations:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/invitations/mine/accept
+            Method: POST
+        InvitationByToken:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/invitations/lookup-by-token
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        Entitlements:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/entitlements/workshops
+            Method: GET
+
+  WorkshopFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-workshop
+      Description: Workshop service. Manages workshops, phases, current-phase transitions, and workshop assistants under /v1/workshops/*.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/workshop/workshop.zip"
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref WorkshopLogGroup
+      Environment:
+        Variables:
+          TABLE_WORKSHOPS: praimana-workshops
+          TABLE_PHASES: praimana-phases
+          TABLE_TEAM_PHASES: praimana-team-phases
+          TABLE_FORMATS: praimana-formats
+          TEAM_SERVICE_URL: !Ref InternalBaseUrl
+          RESOURCES_BUCKET: !Ref ResourcesBucketName
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+      Events:
+        Workshops:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /v1/workshops
+            Method: ANY
+        WorkshopById:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}"
+            Method: ANY
+        WorkshopPhases:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/phases"
+            Method: ANY
+        WorkshopCurrentPhase:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/current-phase"
+            Method: ANY
+        WorkshopAssistants:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/assistants"
+            Method: GET
+        WorkshopStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/status"
+            Method: ANY
+        WorkshopResources:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/resources"
+            Method: GET
+        WorkshopResourceUploads:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/resources/uploads"
+            Method: POST
+        WorkshopResourceUploadComplete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/resources/uploads/complete"
+            Method: POST
+        WorkshopResourceUploadAbort:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/resources/uploads/abort"
+            Method: POST
+        WorkshopResourceDownload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/resources/{resourceId}/download"
+            Method: GET
+        WorkshopResourceDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/resources/{resourceId}"
+            Method: DELETE
+        TeamPhases:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/teams/{teamId}/phases"
+            Method: ANY
+        TeamPhaseById:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/teams/{teamId}/phases/{phaseId}"
+            Method: ANY
+        Lookup:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/lookup/{proxy+}"
+            Method: GET
+
+  CollaborationFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-collaboration
+      Description: Collaboration service. Handles team tasks, messages, and activity events under /v1/teams/{teamId}/{tasks,messages,events}.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/collaboration/collaboration.zip"
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref CollaborationLogGroup
+      Environment:
+        Variables:
+          TABLE_TASKS: praimana-tasks
+          TABLE_MESSAGES: praimana-messages
+          TABLE_COLLABORATION_USERS_READMODEL: praimana-collaboration-users-readmodel
+          TEAM_SERVICE_URL: !Ref InternalBaseUrl
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+      Events:
+        Tasks:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/tasks"
+            Method: ANY
+        TaskById:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/tasks/{taskId}"
+            Method: ANY
+        Messages:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/messages"
+            Method: ANY
+        Events:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/events"
+            Method: GET
+
+  EvaluationFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-evaluation
+      Description: Evaluation service. Manages submissions, scores, and ratings under /v1/submissions/* and /v1/teams/{teamId}/{submissions,ratings}. Dual entry point - also consumes domain events from EvaluationActivityRule to feed the member-activity read-model.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/evaluation/evaluation.zip"
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref EvaluationLogGroup
+      Environment:
+        Variables:
+          TABLE_SUBMISSIONS: praimana-submissions-v2
+          TABLE_SCORES: praimana-scores
+          TABLE_MEMBER_RATINGS: praimana-member-ratings-v2
+          TABLE_EVALUATION_ACTIVITY_READMODEL: praimana-evaluation-activity-readmodel
+          TABLE_EVALUATION_USERS_READMODEL: praimana-evaluation-users-readmodel
+          TABLE_WORKSHOP_RESULTS: praimana-workshop-results
+          TEAM_SERVICE_URL: !Ref InternalBaseUrl
+          DOCS_SERVICE_URL: !Ref InternalBaseUrl
+          WORKSHOP_SERVICE_URL: !Ref InternalBaseUrl
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+      Events:
+        Submissions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/submissions"
+            Method: ANY
+        SubmissionActions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/submissions/{proxy+}"
+            Method: ANY
+        SubmissionById:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/submissions/{submissionId}"
+            Method: ANY
+        SubmissionScores:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/submissions/{submissionId}/scores"
+            Method: ANY
+        SubmissionReads:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/submissions/{submissionId}/{proxy+}"
+            Method: ANY
+        WorkshopActivity:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/activity"
+            Method: GET
+        WorkshopSubmissions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/submissions"
+            Method: ANY
+        WorkshopResults:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/results"
+            Method: ANY
+        WorkshopResultsActions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/workshops/{workshopId}/results/{proxy+}"
+            Method: ANY
+        Ratings:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/ratings"
+            Method: ANY
+
+  EvaluationActivityRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: praimana-evaluation-activity
+      EventBusName: praimana-events
+      Description: Feed member-activity counters in the evaluation read-model.
+      EventPattern:
+        detail-type:
+          - task.created
+          - task.status-changed
+          - message.sent
+          - commit.pushed
+          - ai.thread-shared
+          - ai.response-generated
+      State: ENABLED
+      Targets:
+        - Id: EvaluationFunction
+          Arn: !GetAtt EvaluationFunction.Arn
+          DeadLetterConfig:
+            Arn: !Ref DeadLetterQueueArn
+
+  EvaluationRuleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref EvaluationFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EvaluationActivityRule.Arn
+
+  UserProjectionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: >-
+              Irreducible: the AWS APIs for these actions take NO resource ARN and IAM rejects
+              anything but '*' (dynamodb:ListStreams, cloudwatch:DescribeAlarms, Cost Explorer
+              reads, s3:ListAllMyBuckets, cloudwatch:PutMetricData). Verified by experiment, not
+              assumption - iam simulate said an ARN-scoped resource would work and the live call
+              returned AccessDenied regardless. Each is already narrowed by a query filter or an
+              IAM condition wherever the API permits.
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-user-projection
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: UserProjectionWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-team-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-collaboration-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-source-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-ai-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-evaluation-users-readmodel"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-docs-users-readmodel"
+              - Effect: Allow
+                Action:
+                  - dynamodb:DescribeStream
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/praimana-users/stream/*"
+              - Effect: Allow
+                Action: dynamodb:ListStreams
+                Resource: "*"
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !Ref DeadLetterQueueArn
+
+  UserProjectionFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-user-projection
+      Description: >-
+        Fans every change to praimana-users, via its DynamoDB Stream, out into all
+        five services' users read-models so member lists, chat and commit authors,
+        shared-thread bylines and contribution rows render a name.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/user-projection/user-projection.zip"
+      Handler: handler.handler
+      Role: !GetAtt UserProjectionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref UserProjectionLogGroup
+      ReservedConcurrentExecutions: 2
+      Environment:
+        Variables:
+          TABLE_TEAM_USERS_READMODEL: praimana-team-users-readmodel
+          TABLE_COLLABORATION_USERS_READMODEL: praimana-collaboration-users-readmodel
+          TABLE_SOURCE_USERS_READMODEL: praimana-source-users-readmodel
+          TABLE_AI_USERS_READMODEL: praimana-ai-users-readmodel
+          TABLE_EVALUATION_USERS_READMODEL: praimana-evaluation-users-readmodel
+          TABLE_DOCS_USERS_READMODEL: praimana-docs-users-readmodel
+
+  UserProjectionStream:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !Ref UsersTableStreamArn
+      FunctionName: !Ref UserProjectionFunction
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 1
+      ParallelizationFactor: 1
+      MaximumRetryAttempts: 3
+      MaximumRecordAgeInSeconds: 3600
+      BisectBatchOnFunctionError: true
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      DestinationConfig:
+        OnFailure:
+          Destination: !Ref DeadLetterQueueArn
+
+  SourceFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-source
+      Description: Source service. Tracks git commit stats and file metadata pushed from the desktop app under /v1/teams/{teamId}/{commits,files}.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/source/source.zip"
+      Handler: handler.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref SourceLogGroup
+      Environment:
+        Variables:
+          TABLE_GIT_COMMITS: praimana-git-commits
+          TABLE_GIT_FILES: praimana-git-files
+          TABLE_SOURCE_USERS_READMODEL: praimana-source-users-readmodel
+          TEAM_SERVICE_URL: !Ref InternalBaseUrl
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+      Events:
+        Commits:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/commits"
+            Method: ANY
+        CommitBySha:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/commits/{sha}"
+            Method: ANY
+        Files:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/files"
+            Method: GET
+
+  DocsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-docs
+      Description: Docs service. Stores committed .md files in the versioned S3 bucket (workshop/<id>/team/<id>/<path>) and serves versions/content under /v1/teams/{teamId}/docs*.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/docs/docs.zip"
+      Handler: handler.handler
+      Role: !GetAtt DocsRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref DocsLogGroup
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          DOCS_BUCKET: !Ref DocsBucketName
+          DOCS_BUCKET_OWNER: !Ref AWS::AccountId
+          TABLE_DOCS: praimana-docs
+          TABLE_TEAMS: praimana-teams
+          TABLE_TEAM_MEMBERS: praimana-team-members
+          TABLE_DOCS_USERS_READMODEL: praimana-docs-users-readmodel
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+      Events:
+        DocsWrite:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/docs"
+            Method: POST
+        DocsList:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/docs"
+            Method: GET
+        DocsDelete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/docs"
+            Method: DELETE
+        DocsVersions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/docs/versions"
+            Method: GET
+        DocsContent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/docs/content"
+            Method: GET
+        DocsUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/docs/upload-url"
+            Method: POST
+        DocsUploadComplete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/teams/{teamId}/docs/upload-complete"
+            Method: POST
+
+  DesktopFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-desktop
+      Description: Desktop-installer service. Presigns the newest macOS/Windows installer from the shared artifact bucket and 302-redirects to it under /v1/desktop/*.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/desktop/desktop.zip"
+      Handler: handler.handler
+      Role: !GetAtt DesktopRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref DesktopLogGroup
+      Environment:
+        Variables:
+          DESKTOP_BUCKET: !Ref DesktopBucket
+          DESKTOP_BUCKET_OWNER: !If [HasDesktopBucketOwner, !Ref DesktopBucketOwnerAccountId, !Ref AWS::AccountId]
+          DESKTOP_PREFIX: "desktop/"
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+      Events:
+        DesktopReleases:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/desktop/releases"
+            Method: GET
+        DesktopDownload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/desktop/download"
+            Method: GET
+
+  BulkProvisionRole:
+    Type: AWS::IAM::Role
+    Condition: BulkProvisionEnabled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: >-
+              Explicit resource name is a cross-stack contract, and removing it makes
+              CloudFormation REPLACE the resource. For the DynamoDB tables that DESTROYS
+              PRODUCTION DATA, so the explicit name is retained deliberately. Changing it is
+              out of scope precisely because it forces a destructive replacement.
+    Properties:
+      RoleName: praimana-bulk-provision
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref KmsUsePolicy
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BulkProvisionInvokeServices
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:praimana-team"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:praimana-user-access"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:praimana-notify"
+
+  BulkProvisionFunction:
+    Type: AWS::Serverless::Function
+    Condition: BulkProvisionEnabled
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-bulk-provision
+      Description: Bulk team provisioning worker. Async EventBridge target; invokes team/user-access/notify directly.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/bulk-provision/bulk-provision.zip"
+      Handler: handler.handler
+      Role: !GetAtt BulkProvisionRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref BulkProvisionLogGroup
+      Timeout: 300
+      MemorySize: 512
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          TEAM_FUNCTION_NAME: praimana-team
+          USER_ACCESS_FUNCTION_NAME: praimana-user-access
+          NOTIFY_FUNCTION_NAME: praimana-notify
+          APP_URL: !Ref PortalUrl
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+
+  BulkProvisionRule:
+    Type: AWS::Events::Rule
+    Condition: BulkProvisionEnabled
+    Properties:
+      Name: praimana-bulk-provision
+      EventBusName: praimana-events
+      Description: Run a validated bulk team-provisioning plan.
+      EventPattern:
+        detail-type:
+          - bulk-provision.requested
+      State: ENABLED
+      Targets:
+        - Id: BulkProvisionFunction
+          Arn: !GetAtt BulkProvisionFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !Ref DeadLetterQueueArn
+
+  BulkProvisionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: BulkProvisionEnabled
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BulkProvisionFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BulkProvisionRule.Arn
+
+  NotifyFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-notify
+      Description: Notify service. Renders branded transactional email from semantic fields and sends it via SESv2 (cross-account delegate sender) under /v1/notify/*.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/notify/notify.zip"
+      Handler: handler.handler
+      Role: !GetAtt NotifyRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref NotifyLogGroup
+      Environment:
+        Variables:
+          EMAIL_FROM: !Ref EmailFrom
+          SEND_QUOTA_TABLE: praimana-send-quota
+          EMAIL_REPLY_TO: !Ref EmailReplyTo
+          SES_IDENTITY_ARN: !Ref SesIdentityArn
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+          NOTIFY_ALLOWED_LINK_ORIGINS: !Ref PortalUrl
+      Events:
+        NotifyRoutes:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/notify/{proxy+}"
+            Method: ANY
+
+  UserAccessFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: >-
+              Lambda-in-VPC declined: placing these functions in a VPC breaks reachability of
+              Cognito Managed Login through PrivateLink, and adds cold-start latency to every
+              request, so it is accepted here as an out-of-scope change.
+          - id: W92
+            reason: >-
+              Reserved concurrency DEFERRED, not declined: reserving both floors and caps, and
+              no stated peak-concurrent-participants figure exists anywhere in the repo. A
+              guessed cap sheds real workshop traffic on the day it matters most. Load shedding
+              is already observable via API Gateway 429. Re-tune once a capacity figure exists.
+      checkov:
+        skip:
+          - id: CKV_AWS_115
+            comment: >-
+              Reserved concurrency DEFERRED: no stated peak-concurrency figure exists; a guessed
+              cap sheds real traffic. Already shed observably as HTTP 429 at API Gateway.Re-review when a capacity figure exists.
+          - id: CKV_AWS_116
+            comment: >-
+              DLQ exists at the TRIGGER layer, which is the correct and more granular place:
+              EventBridge Rule DeadLetterConfig and EventSourceMapping
+              DestinationConfig.OnFailure, both targeting the shared DLQ with bounded retry. 13
+              of these 15 functions are invoked SYNCHRONOUSLY, where this function-level
+              property is inert. Both async consumers verified idempotent.
+          - id: CKV_AWS_117
+            comment: >-
+              Lambda-in-VPC declined: it breaks reachability of Cognito Managed Login through
+              PrivateLink and adds cold-start latency, so it is not adopted.
+    Properties:
+      KmsKeyArn: !Ref KmsKeyArn
+      FunctionName: praimana-user-access
+      Description: User Access service. The ONE holder of Cognito admin writes — provisions an invited address's account (AdminCreateUser + group + profile row + user.created) under /v1/user-access/*. Runs OUTSIDE the VPC because cognito-idp is unreachable from it.
+      CodeUri:
+        Bucket: !Ref ServicesBucket
+        Key: !Sub "lambda/v${ReleaseVersion}/user-access/user-access.zip"
+      Handler: handler.handler
+      Role: !GetAtt UserAccessRole.Arn
+      LoggingConfig:
+        LogGroup: !Ref UserAccessLogGroup
+      Environment:
+        Variables:
+          COGNITO_USER_POOL_ID: !Ref UserPoolId
+          TABLE_USERS: praimana-users
+          TABLE_INVITATIONS: praimana-invitations
+          TABLE_AUDIT: praimana-audit
+          COGNITO_ISSUER: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"
+          COGNITO_AUDIENCE: !Ref UserPoolClientId
+      Events:
+        UserAccessRoutes:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/v1/user-access/{proxy+}"
+            Method: ANY
+
+  ApiDomainName:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: DomainEnabled
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref AcmCertificateArn
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: DomainEnabled
+    # ⚠ The $default STAGE is generated by the SAM transform (logical id
+    # <ApiLogicalId>ApiGatewayDefaultStage), and nothing else orders this mapping after it. Without
+    # this DependsOn the mapping races the stage and fails with "Invalid stage identifier
+    # specified" - seen on the first deploy with EnableCustomDomain=true.
+    DependsOn: HttpApiApiGatewayDefaultStage
+    Properties:
+      ApiId: !Ref HttpApi
+      DomainName: !Ref ApiDomainName
+      Stage: $default
+
+Outputs:
+  ApiEndpoint:
+    Description: >
+      The HTTP API's invoke URL. ⚠ THIS IS THE SECOND-PASS VALUE: re-deploy this stack with
+      InternalBaseUrl set to this plus /v1 so the services can make east-west calls. It is a
+      parameter rather than a reference precisely because a function reading it off HttpApi
+      would create a cycle.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  ApiId:
+    Description: >
+      HTTP API id. The observability tier takes this as a parameter for its alarm dimensions -
+      the only thing it needs from here.
+    Value: !Ref HttpApi
+
+  InternalBaseUrlForSecondPass:
+    Description: Paste verbatim into InternalBaseUrl and re-deploy. Must be https and end in /v1.
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/v1"

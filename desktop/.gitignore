@@ -1,0 +1,18 @@
+# Build output and dependencies — never committed.
+node_modules/
+dist/
+# electron-builder output: 195MB installers per build. A standalone repo needs this entry
+# or the first `git add -A` commits ~400MB of binaries.
+release/
+*.tsbuildinfo
+.turbo/
+.DS_Store
+# ASH security scan output: 6.6MB of findings data, absolute paths and
+# secret-adjacent source context. Never committed. The `.ash/.ash.yaml` config
+# is force-added deliberately if the scan scope should be shared.
+.ash/
+
+# Per-experience desktop config, placed next to start.sh by the user after download.
+# It carries a specific deployment's portal/API/pool/client values, so it is never
+# committed — the start scripts and START-HERE.md ship generic; connect.json does not.
+connect.json

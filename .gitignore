@@ -1,4 +1,35 @@
-.kiro/*
+# AI assistant and editor workspace config (local, per developer)
+.kiro/
+.kiro_bkp/
+.claude/
+CLAUDE.local.md
+.codex/
+.cursor/
+.vscode/
+.idea/
+.threatmodel/
+
 # Local deployment config and state (account-specific; never commit)
 infra/scripts/deploy-config.json
 infra/scripts/.state/
+
+# Dependencies and build output (also ignored per component)
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+test-results/
+playwright-report/
+blob-report/
+coverage/
+.turbo/
+.ash/
+
+# Secrets and local env files (.env.example templates stay committed)
+.env
+.env.*
+!.env.example
+
+# OS and logs
+.DS_Store
+*.log

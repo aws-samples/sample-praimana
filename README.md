@@ -51,6 +51,17 @@ group): **Participant, Facilitator, Executive, Judge, Admin**.
 
 ---
 
+## Demo
+
+| Portal | Desktop |
+|---|---|
+| [![Praimana portal walkthrough](videos/praimana-portal-cover.jpg)](videos/praimana-portal.mp4) | [![Praimana desktop walkthrough](videos/praimana-desktop-cover.jpg)](videos/praimana-desktop.mp4) |
+| Facilitator and executive web app (1 min 52 s) | Participant client with the AI assistant (2 min 5 s) |
+
+Select a video to open it on GitHub.
+
+---
+
 ## Architecture
 
 Praimana is local-first at the edge and serverless in the middle. Everything deploys into **your own

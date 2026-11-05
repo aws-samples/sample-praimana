@@ -33,3 +33,7 @@ coverage/
 # OS and logs
 .DS_Store
 *.log
+
+# Raw screen recordings and source images; the README uses the compressed MP4s and JPEG cover
+videos/*.mov
+*.heic

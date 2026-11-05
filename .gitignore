@@ -34,6 +34,7 @@ coverage/
 .DS_Store
 *.log
 
-# Raw screen recordings and source images; the README uses the compressed MP4s and JPEG cover
+# Demo videos are hosted on YouTube; keep recordings and source images out of the repo
 videos/*.mov
+videos/*.mp4
 *.heic

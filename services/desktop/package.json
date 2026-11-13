@@ -15,7 +15,7 @@
     "@praimana/service-shared": "workspace:*",
     "@aws-sdk/client-s3": "3.1096.0",
     "@aws-sdk/s3-request-presigner": "3.1096.0",
-    "@hono/node-server": "1.19.17",
+    "@hono/node-server": "2.1.6",
     "hono": "4.13.11"
   },
   "devDependencies": {

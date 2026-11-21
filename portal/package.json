@@ -22,7 +22,7 @@
     "@trpc/server": "11.18.0",
     "aws-amplify": "6.20.0",
     "jose": "6.2.9",
-    "next": "15.5.28",
+    "next": "15.5.29",
     "next-auth": "5.0.0-beta.32",
     "qrcode": "1.5.4",
     "react": "19.2.8",
